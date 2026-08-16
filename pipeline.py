@@ -11,6 +11,10 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+# ייבוא Telethon עבור התחברות דרך StringSession
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
 # הגדרות כלליות
 MAX_TELEGRAM_CHARS = 4000
 MAX_VIDEOS_TO_SCAN = 15
@@ -23,22 +27,35 @@ SPEAKER_URLS = {
 
 
 # ==========================================
-# שליחת הודעות לטלגרם דרך Bot API
+# שליחה לטלגרם באמצעות Telethon (StringSession)
 # ==========================================
-def send_telegram_message(bot_token: str, chat_id: str, text: str) -> bool:
-    """שולחת הודעה יחידה לטלגרם באמצעות Telegram Bot API."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.ok
-    except Exception as e:
-        print(f"❌ שגיאה בשליחה לטלגרם: {e}")
-        return False
+async def send_to_telegram(full_text: str, video_title: str, video_url: str):
+    api_id_env = os.getenv("TELEGRAM_API_ID")
+    api_hash = os.getenv("TELEGRAM_API_HASH")
+    session_str = os.getenv("TELEGRAM_SESSION_STRING")
+    target_user = os.getenv("TELEGRAM_TARGET_USER")
+
+    if not all([api_id_env, api_hash, session_str, target_user]):
+        print("⚠️ משתני סביבה של טלגרם חסרים. הודעה לא תישלח לטלגרם.")
+        return
+
+    api_id = int(api_id_env)
+    text_chunks = split_text(full_text, MAX_TELEGRAM_CHARS)
+
+    async with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+        # הודעת כותרת
+        header_msg = f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\nהתוכן מתחיל מטה 👇"
+        await client.send_message(target_user, header_msg)
+        await asyncio.sleep(1.0)
+
+        # שליחת חלקי הטקסט
+        for index, chunk in enumerate(text_chunks, 1):
+            await client.send_message(target_user, chunk)
+            await asyncio.sleep(1.2)
+
+        # הודעת סגירה
+        footer_msg = f"🔗 **קישור לסרטון המקורי ביוטיוב:**\n{video_url}\n\n✨ המשימה הושלמה בהצלחה!"
+        await client.send_message(target_user, footer_msg)
 
 
 # ==========================================
@@ -207,15 +224,7 @@ class GeminiTranslator:
 # הצינור הראשי שיופעל מרחוק
 # ==========================================
 def run_pipeline(video_url: str = None, speaker: str = None):
-    """
-    מריץ את הפייפליין.
-    ניתן להעביר קישור ישיר (video_url) או שם דרשן (speaker: 'salah' / 'khateb').
-    מחזיר דיקשנרי עם תוצאה: {'success': True/False, 'message': '...', 'translation': '...'}
-    """
     gemini_key = os.getenv("GEMINI_API_KEY")
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
     video_title = "סרטון יוטיוב"
 
     # איתור קישור לפי דרשן במידת הצורך
@@ -258,18 +267,11 @@ def run_pipeline(video_url: str = None, speaker: str = None):
         with open(translated_file, "r", encoding="utf-8") as f:
             full_translated_text = f.read()
 
-        # 3. שליחה לטלגרם במידת הניתן
-        if bot_token and telegram_chat_id:
-            header = f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\n"
-            send_telegram_message(bot_token, telegram_chat_id, header)
-
-            chunks = split_text(full_translated_text, MAX_TELEGRAM_CHARS)
-            for chunk in chunks:
-                send_telegram_message(bot_token, telegram_chat_id, chunk)
-                time.sleep(0.5)
-
-            footer = f"\n🔗 **קישור לסרטון:**\n{video_url}\n✨ הושלם בהצלחה!"
-            send_telegram_message(bot_token, telegram_chat_id, footer)
+        # 3. שליחה לטלגרם דרך Telethon
+        try:
+            asyncio.run(send_to_telegram(full_translated_text, video_title, video_url))
+        except Exception as e:
+            print(f"⚠️ שגיאה במהלך שליחה לטלגרם: {e}")
 
         return {
             "success": True,
