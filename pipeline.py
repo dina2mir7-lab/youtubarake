@@ -203,7 +203,6 @@ def fetch_transcript(url_or_id: str) -> str:
 
             return "\n".join(transcript_lines)
     finally:
-        # מחיקת הקובץ הזמני בסיום
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
 
