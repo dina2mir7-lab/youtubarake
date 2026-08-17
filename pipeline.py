@@ -1,10 +1,10 @@
 import asyncio
-import datetime
 import os
 import re
 import tempfile
-from pathlib import Path
+import time
 from typing import Optional
+from urllib.request import Request, urlopen
 
 import yt_dlp
 from google import genai
@@ -12,6 +12,7 @@ from google.genai import types
 from google.genai.errors import APIError
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+
 
 MAX_TELEGRAM_CHARS = int(os.getenv("MAX_TELEGRAM_CHARS", "4000"))
 MAX_VIDEOS_TO_SCAN = int(os.getenv("MAX_VIDEOS_TO_SCAN", "20"))
@@ -33,12 +34,19 @@ LANGUAGES = ["ar", "he", "en"]
 def _cookie_file_from_env():
     """Return (path, temporary). Supports a server file or Netscape cookies text."""
     explicit = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+
     if explicit and os.path.exists(explicit):
         return explicit, False
 
     text = os.getenv("YOUTUBE_COOKIES_TEXT", "")
+
     if text.strip():
-        f = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8")
+        f = tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            suffix=".txt",
+            encoding="utf-8",
+        )
         f.write(text)
         f.close()
         return f.name, True
@@ -47,6 +55,13 @@ def _cookie_file_from_env():
 
 
 def _youtube_opts(extra=None):
+    """
+    Build yt-dlp options.
+
+    Important:
+    These options are used only for metadata/subtitle extraction.
+    No video format is selected and no video is downloaded.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -55,13 +70,16 @@ def _youtube_opts(extra=None):
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
-        "noplaylist": True,
     }
+
     cookie_file, temporary = _cookie_file_from_env()
+
     if cookie_file:
         opts["cookiefile"] = cookie_file
+
     if extra:
         opts.update(extra)
+
     return opts, cookie_file, temporary
 
 
@@ -73,104 +91,174 @@ def _cleanup_cookie(cookie_file, temporary):
             pass
 
 
-def get_target_dates_strings():
-    today = datetime.date.today()
-    days_to_subtract = (today.weekday() - 4) % 7
-    last_friday = today - datetime.timedelta(days=days_to_subtract)
-    last_saturday = last_friday + datetime.timedelta(days=1)
+def find_latest_friday_video(
+    url: str,
+    max_videos: int = MAX_VIDEOS_TO_SCAN,
+):
+    """
+    Find the newest video published on the configured YouTube
+    channel/playlist.
 
-    separators = [".", "/", "-"]
-    date_formats = set()
+    IMPORTANT:
+    This function only retrieves YouTube metadata.
+    It does NOT download any video.
+    """
 
-    for target_date in (last_friday, last_saturday):
-        days = [str(target_date.day), target_date.strftime("%d")]
-        months = [str(target_date.month), target_date.strftime("%m")]
-        years = [str(target_date.year), str(target_date.year)[2:]]
-        for d in days:
-            for m in months:
-                for y in years:
-                    for sep in separators:
-                        date_formats.add(f"{d}{sep}{m}{sep}{y}")
-    return date_formats
-
-
-def find_latest_friday_video(url: str, max_videos: int = MAX_VIDEOS_TO_SCAN):
-    """Scan the configured channel/playlist and select a Friday/Saturday video by title."""
-    target_dates = get_target_dates_strings()
     opts, cookie_file, temporary = _youtube_opts(
         {
-            "extract_flat": True,
             "skip_download": True,
+            "extract_flat": False,
+            "noplaylist": False,
             "playlistend": max_videos,
         }
     )
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
             if not info:
                 return None, None
 
             entries = info.get("entries") or []
+
             if not entries and info.get("id"):
                 entries = [info]
+
+            videos = []
 
             for video in entries:
                 if not video:
                     continue
-                title = video.get("title") or ""
+
                 video_id = video.get("id") or video.get("video_id")
+
                 if not video_id:
                     continue
-                if any(d in title for d in target_dates):
-                    return f"https://www.youtube.com/watch?v={video_id}", title
 
-            return None, None
+                title = video.get("title") or "סרטון יוטיוב"
+
+                upload_date = video.get("upload_date") or ""
+                timestamp = video.get("timestamp") or 0
+
+                videos.append(
+                    {
+                        "id": video_id,
+                        "title": title,
+                        "upload_date": upload_date,
+                        "timestamp": timestamp or 0,
+                    }
+                )
+
+            if not videos:
+                return None, None
+
+            # Prefer the actual upload date.
+            # timestamp is used as a fallback.
+            def sort_key(video):
+                upload_date = video["upload_date"]
+
+                if upload_date and re.fullmatch(r"\d{8}", upload_date):
+                    try:
+                        return (
+                            int(upload_date),
+                            int(video["timestamp"] or 0),
+                        )
+                    except ValueError:
+                        pass
+
+                return (
+                    0,
+                    int(video["timestamp"] or 0),
+                )
+
+            videos.sort(key=sort_key, reverse=True)
+
+            latest = videos[0]
+
+            video_url = (
+                f"https://www.youtube.com/watch?v={latest['id']}"
+            )
+
+            return video_url, latest["title"]
+
     finally:
         _cleanup_cookie(cookie_file, temporary)
 
 
 def extract_video_id(url_or_id: str) -> str:
     value = url_or_id.strip()
+
     patterns = [
         r"(?:v=)([A-Za-z0-9_-]{11})",
         r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
         r"(?:youtube\.com/(?:shorts|embed|live)/)([A-Za-z0-9_-]{11})",
         r"^([A-Za-z0-9_-]{11})$",
     ]
+
     for pattern in patterns:
         match = re.search(pattern, value)
+
         if match:
             return match.group(1)
-    raise ValueError("לא ניתן לזהות Video ID מתוך קישור YouTube שסופק.")
+
+    raise ValueError(
+        "לא ניתן לזהות Video ID מתוך קישור YouTube שסופק."
+    )
 
 
 def _clean_vtt(vtt_text: str) -> str:
     """Convert VTT into readable text and remove duplicate caption lines."""
+
     text = vtt_text.replace("\ufeff", "")
     lines = text.splitlines()
+
     result = []
     previous = None
 
     for raw in lines:
         line = raw.strip()
+
         if not line:
             continue
-        if line == "WEBVTT" or line.startswith("NOTE"):
+
+        if line == "WEBVTT":
             continue
+
+        if line.startswith("NOTE"):
+            continue
+
         if re.match(r"^\d+$", line):
             continue
+
         if "-->" in line:
             continue
+
         # Remove common VTT markup.
-        line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", "", line)
-        line = re.sub(r"</?c(?:\.[^>]*)?>", "", line)
+        line = re.sub(
+            r"<\d{2}:\d{2}:\d{2}\.\d{3}>",
+            "",
+            line,
+        )
+
+        line = re.sub(
+            r"</?c(?:\.[^>]*)?>",
+            "",
+            line,
+        )
+
         line = re.sub(r"<[^>]+>", "", line)
+
         line = re.sub(r"&amp;", "&", line)
         line = re.sub(r"&lt;", "<", line)
         line = re.sub(r"&gt;", ">", line)
+
         line = re.sub(r"\s+", " ", line).strip()
+
         if not line:
             continue
+
+        # YouTube captions often repeat the previous caption.
         if line != previous:
             result.append(line)
             previous = line
@@ -178,81 +266,298 @@ def _clean_vtt(vtt_text: str) -> str:
     return "\n".join(result)
 
 
-def fetch_transcript(video_url: str) -> str:
-    """Download YouTube captions through yt-dlp, using cookies when supplied."""
-    video_id = extract_video_id(video_url)
-    with tempfile.TemporaryDirectory(prefix=f"yt_{video_id}_") as workdir:
-        outtmpl = str(Path(workdir) / "caption.%(ext)s")
-        opts, cookie_file, temporary = _youtube_opts(
-            {
-                "skip_download": True,
-                "writesubtitles": True,
-                "writeautomaticsub": True,
-                "subtitleslangs": LANGUAGES,
-                "subtitlesformat": "vtt",
-                "outtmpl": outtmpl,
-            }
+def _select_subtitle_track(info, language):
+    """
+    Select the best subtitle track for a requested language.
+
+    Preference:
+    1. manually supplied subtitles
+    2. automatic captions
+    """
+
+    subtitles = info.get("subtitles") or {}
+    automatic_captions = info.get("automatic_captions") or {}
+
+    # Manual subtitles first.
+    tracks = subtitles.get(language)
+
+    if tracks:
+        return tracks
+
+    # Try regional variants, e.g. ar-SA / he-IL / en-US.
+    for lang, lang_tracks in subtitles.items():
+        if lang.lower().split("-")[0] == language:
+            return lang_tracks
+
+    # Automatic captions.
+    tracks = automatic_captions.get(language)
+
+    if tracks:
+        return tracks
+
+    # Regional variants for automatic captions.
+    for lang, lang_tracks in automatic_captions.items():
+        if lang.lower().split("-")[0] == language:
+            return lang_tracks
+
+    return None
+
+
+def _select_vtt_format(tracks):
+    """
+    Select a VTT subtitle format from a YouTube subtitle track.
+    """
+
+    if not tracks:
+        return None
+
+    # Prefer VTT.
+    for track in tracks:
+        ext = (track.get("ext") or "").lower()
+
+        if ext == "vtt" and track.get("url"):
+            return track
+
+    # Fall back to any text-based subtitle format.
+    preferred_extensions = [
+        "srv3",
+        "srv2",
+        "srv1",
+        "ttml",
+        "json3",
+    ]
+
+    for preferred_ext in preferred_extensions:
+        for track in tracks:
+            if (
+                (track.get("ext") or "").lower() == preferred_ext
+                and track.get("url")
+            ):
+                return track
+
+    # Last resort: first track with a URL.
+    for track in tracks:
+        if track.get("url"):
+            return track
+
+    return None
+
+
+def _download_subtitle_text(
+    subtitle_url: str,
+    ydl: yt_dlp.YoutubeDL,
+) -> str:
+    """
+    Download only the subtitle resource.
+
+    This does NOT download the YouTube video.
+    """
+
+    try:
+        # Use yt-dlp's own HTTP client so cookies/headers configured
+        # for YouTube can be reused.
+        response = ydl.urlopen(subtitle_url)
+        data = response.read()
+
+        return data.decode("utf-8", errors="replace")
+
+    except Exception:
+        # Fallback for environments where ydl.urlopen is unavailable.
+        request = Request(
+            subtitle_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/150 Safari/537.36"
+                )
+            },
         )
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                if not info:
-                    raise RuntimeError("YouTube לא החזיר מידע על הסרטון.")
 
-                # download subtitles only; no video is downloaded
-                ydl.download([video_url])
+        with urlopen(request, timeout=30) as response:
+            return response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
 
-            candidates = sorted(Path(workdir).glob("*.vtt"))
-            if not candidates:
+
+def fetch_transcript(video_url: str) -> str:
+    """
+    Fetch the YouTube transcript WITHOUT downloading the video.
+
+    Priority:
+    Arabic -> Hebrew -> English
+
+    For each language:
+    manual subtitles -> automatic captions
+    """
+
+    video_id = extract_video_id(video_url)
+
+    opts, cookie_file, temporary = _youtube_opts(
+        {
+            "skip_download": True,
+            "noplaylist": True,
+        }
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+
+            # Metadata only.
+            # download=False is critical.
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+            if not info:
                 raise RuntimeError(
-                    "לא נמצאו כתוביות/טרנסקריפט לסרטון. אם הסרטון מוגן, ודא שקובץ cookies.txt תקין ומעודכן."
+                    "YouTube לא החזיר מידע על הסרטון."
                 )
 
-            # Prefer Arabic, then Hebrew, then English.
-            def score(path):
-                name = path.name.lower()
-                return next((i for i, lang in enumerate(LANGUAGES) if f".{lang}." in name), 99)
+            subtitle_track = None
+            selected_language = None
 
-            candidates.sort(key=score)
-            transcript = _clean_vtt(candidates[0].read_text(encoding="utf-8", errors="replace"))
+            for language in LANGUAGES:
+                tracks = _select_subtitle_track(
+                    info,
+                    language,
+                )
+
+                selected_track = _select_vtt_format(tracks)
+
+                if selected_track:
+                    subtitle_track = selected_track
+                    selected_language = language
+                    break
+
+            if not subtitle_track:
+                available_manual = list(
+                    (info.get("subtitles") or {}).keys()
+                )
+
+                available_auto = list(
+                    (info.get("automatic_captions") or {}).keys()
+                )
+
+                raise RuntimeError(
+                    "לא נמצאו כתוביות/טרנסקריפט לסרטון. "
+                    f"שפות כתוביות זמינות: {available_manual or 'אין'}; "
+                    f"שפות כתוביות אוטומטיות זמינות: "
+                    f"{available_auto or 'אין'}. "
+                    "אם הסרטון מוגן, ודא שקובץ cookies.txt תקין ומעודכן."
+                )
+
+            subtitle_url = subtitle_track.get("url")
+
+            if not subtitle_url:
+                raise RuntimeError(
+                    f"נמצא track ל-{selected_language}, "
+                    "אך אין לו URL להורדה."
+                )
+
+            # IMPORTANT:
+            # This downloads ONLY the subtitle resource.
+            # No video format is selected or downloaded.
+            subtitle_text = _download_subtitle_text(
+                subtitle_url,
+                ydl,
+            )
+
+            if not subtitle_text.strip():
+                raise RuntimeError(
+                    "קובץ הכתוביות התקבל אך הוא ריק."
+                )
+
+            transcript = _clean_vtt(subtitle_text)
+
             if not transcript.strip():
-                raise RuntimeError("קובץ הכתוביות נמצא אך הוא ריק.")
+                raise RuntimeError(
+                    "הכתוביות התקבלו אך לא ניתן היה לחלץ מהן טקסט."
+                )
+
             return transcript
-        finally:
-            _cleanup_cookie(cookie_file, temporary)
+
+    finally:
+        _cleanup_cookie(cookie_file, temporary)
 
 
 def get_video_title(video_url: str) -> str:
-    opts, cookie_file, temporary = _youtube_opts({"skip_download": True})
+    """
+    Retrieve video title only.
+    No video is downloaded.
+    """
+
+    opts, cookie_file, temporary = _youtube_opts(
+        {
+            "skip_download": True,
+            "noplaylist": True,
+        }
+    )
+
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            return (info or {}).get("title") or "סרטון יוטיוב"
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+            return (
+                (info or {}).get("title")
+                or "סרטון יוטיוב"
+            )
+
     finally:
-        _cleanup_cookie(cookie_file, temporary)
+        _cleanup_cookie(
+            cookie_file,
+            temporary,
+        )
 
 
 class GeminiTranslator:
     def __init__(self, api_key: str):
         if not api_key:
-            raise ValueError("GEMINI_API_KEY חסר ב-Environment Variables.")
-        self.client = genai.Client(api_key=api_key)
+            raise ValueError(
+                "GEMINI_API_KEY חסר ב-Environment Variables."
+            )
+
+        self.client = genai.Client(
+            api_key=api_key
+        )
+
         self.models = [
-            os.getenv("GEMINI_PRIMARY_MODEL", "gemini-2.5-flash"),
-            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
+            os.getenv(
+                "GEMINI_PRIMARY_MODEL",
+                "gemini-2.5-flash",
+            ),
+            os.getenv(
+                "GEMINI_FALLBACK_MODEL",
+                "gemini-3.1-flash-lite",
+            ),
         ]
 
     def translate_text(self, text: str) -> str:
-        """Translate the complete transcript. For long transcripts, process safe chunks."""
-        # Keep chunks comfortably below common request limits.
-        chunk_size = int(os.getenv("TRANSLATION_CHUNK_CHARS", "45000"))
-        chunks = split_text(text, chunk_size)
+        """Translate the complete transcript."""
+
+        chunk_size = int(
+            os.getenv(
+                "TRANSLATION_CHUNK_CHARS",
+                "45000",
+            )
+        )
+
+        chunks = split_text(
+            text,
+            chunk_size,
+        )
+
         translated = []
 
         system_instruction = (
             "אתה מתרגם מקצועי ומומחה לשפה הערבית והעברית. "
             "תרגם את התמלול מערבית לעברית. מדובר בתמלול של דרשה. "
-            "התמלול עשוי להכיל שבירות שורה קצרות שנוצרו מאופי הכתוביות; התעלם מהן וחבר את המשפטים לרצף טבעי.\n"
+            "התמלול עשוי להכיל שבירות שורה קצרות שנוצרו מאופי הכתוביות; "
+            "התעלם מהן וחבר את המשפטים לרצף טבעי.\n"
             "כללים מחייבים:\n"
             "1. תרגום מלא ומדויק. אין לסכם, לקצר, להשמיט או להוסיף תוכן.\n"
             "2. שמור על משמעות המקור, שמות, מונחים וציטוטים ככל שניתן.\n"
@@ -263,132 +568,358 @@ class GeminiTranslator:
         )
 
         for index, chunk in enumerate(chunks):
+
             prompt = (
                 "תרגם את החלק הבא במלואו. "
-                "זהו חלק מתוך תמלול ארוך, לכן אל תסכם ואל תדלג על דבר.\n\n" + chunk
+                "זהו חלק מתוך תמלול ארוך, לכן אל תסכם "
+                "ואל תדלג על דבר.\n\n"
+                + chunk
             )
+
             result = None
             last_error = None
+
             for model in self.models:
+
                 for attempt in range(1, 4):
+
                     try:
-                        response = self.client.models.generate_content(
-                            model=model,
-                            contents=[prompt],
-                            config=types.GenerateContentConfig(
-                                system_instruction=system_instruction,
-                                temperature=0.2,
-                            ),
+                        response = (
+                            self.client.models.generate_content(
+                                model=model,
+                                contents=[prompt],
+                                config=types.GenerateContentConfig(
+                                    system_instruction=system_instruction,
+                                    temperature=0.2,
+                                ),
+                            )
                         )
-                        if response.text and response.text.strip():
+
+                        if (
+                            response.text
+                            and response.text.strip()
+                        ):
                             result = response.text.strip()
                             break
+
                     except APIError as exc:
+
                         last_error = exc
-                        code = getattr(exc, "code", None)
-                        if code in (429, 500, 502, 503, 504) or any(
-                            x in str(exc).upper() for x in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "TIMEOUT")
+
+                        code = getattr(
+                            exc,
+                            "code",
+                            None,
+                        )
+
+                        if (
+                            code
+                            in (
+                                429,
+                                500,
+                                502,
+                                503,
+                                504,
+                            )
+                            or any(
+                                x in str(exc).upper()
+                                for x in (
+                                    "RESOURCE_EXHAUSTED",
+                                    "UNAVAILABLE",
+                                    "TIMEOUT",
+                                )
+                            )
                         ):
-                            time_sleep = min(60, 5 * (2 ** (attempt - 1)))
-                            import time
-                            time.sleep(time_sleep)
+                            time_sleep = min(
+                                60,
+                                5 * (2 ** (attempt - 1)),
+                            )
+
+                            time.sleep(
+                                time_sleep
+                            )
+
                             continue
+
                         break
+
                     except Exception as exc:
                         last_error = exc
                         break
+
                 if result:
                     break
 
             if not result:
-                raise RuntimeError(f"Gemini נכשל בתרגום חלק {index + 1}/{len(chunks)}: {last_error}")
+                raise RuntimeError(
+                    "Gemini נכשל בתרגום חלק "
+                    f"{index + 1}/{len(chunks)}: "
+                    f"{last_error}"
+                )
+
             translated.append(result)
 
         return "\n\n".join(translated)
 
 
-def split_text(text: str, max_chars: int):
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+def split_text(
+    text: str,
+    max_chars: int,
+):
+    paragraphs = [
+        p.strip()
+        for p in re.split(
+            r"\n\s*\n",
+            text,
+        )
+        if p.strip()
+    ]
+
     chunks = []
     current = ""
+
     for paragraph in paragraphs:
+
         if len(paragraph) > max_chars:
+
             if current:
-                chunks.append(current.strip())
+                chunks.append(
+                    current.strip()
+                )
                 current = ""
-            for i in range(0, len(paragraph), max_chars):
-                chunks.append(paragraph[i:i + max_chars].strip())
+
+            for i in range(
+                0,
+                len(paragraph),
+                max_chars,
+            ):
+                chunks.append(
+                    paragraph[
+                        i : i + max_chars
+                    ].strip()
+                )
+
             continue
-        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+
+        candidate = (
+            f"{current}\n\n{paragraph}"
+            if current
+            else paragraph
+        )
+
         if len(candidate) > max_chars:
-            chunks.append(current.strip())
+
+            if current:
+                chunks.append(
+                    current.strip()
+                )
+
             current = paragraph
+
         else:
             current = candidate
+
     if current.strip():
-        chunks.append(current.strip())
+        chunks.append(
+            current.strip()
+        )
+
     return chunks
 
 
-async def send_to_telegram(full_text: str, video_title: str, video_url: str):
-    api_id_env = os.getenv("TELEGRAM_API_ID")
-    api_hash = os.getenv("TELEGRAM_API_HASH")
-    session_str = os.getenv("TELEGRAM_SESSION_STRING")
-    target_user = os.getenv("TELEGRAM_TARGET_USER")
-    if not all([api_id_env, api_hash, session_str, target_user]):
-        return False, "משתני טלגרם חסרים; התרגום הושלם אך לא נשלח לטלגרם."
+async def send_to_telegram(
+    full_text: str,
+    video_title: str,
+    video_url: str,
+):
+    api_id_env = os.getenv(
+        "TELEGRAM_API_ID"
+    )
+
+    api_hash = os.getenv(
+        "TELEGRAM_API_HASH"
+    )
+
+    session_str = os.getenv(
+        "TELEGRAM_SESSION_STRING"
+    )
+
+    target_user = os.getenv(
+        "TELEGRAM_TARGET_USER"
+    )
+
+    if not all(
+        [
+            api_id_env,
+            api_hash,
+            session_str,
+            target_user,
+        ]
+    ):
+        return (
+            False,
+            "משתני טלגרם חסרים; "
+            "התרגום הושלם אך לא נשלח לטלגרם.",
+        )
 
     api_id = int(api_id_env)
-    chunks = split_text(full_text, MAX_TELEGRAM_CHARS)
-    async with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+
+    chunks = split_text(
+        full_text,
+        MAX_TELEGRAM_CHARS,
+    )
+
+    async with TelegramClient(
+        StringSession(session_str),
+        api_id,
+        api_hash,
+    ) as client:
+
         await client.send_message(
             target_user,
-            f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\nהתוכן מתחיל מטה 👇",
+            (
+                f"🎬 **תרגום אוטומטי לדרשה**\n"
+                f"📌 **כותרת:** {video_title}\n\n"
+                "התוכן מתחיל מטה 👇"
+            ),
         )
+
         for chunk in chunks:
-            await client.send_message(target_user, chunk)
+            await client.send_message(
+                target_user,
+                chunk,
+            )
+
             await asyncio.sleep(1.1)
+
         await client.send_message(
             target_user,
-            f"🔗 **קישור לסרטון המקורי ביוטיוב:**\n{video_url}\n\n✨ המשימה הושלמה בהצלחה!",
+            (
+                "🔗 **קישור לסרטון המקורי ביוטיוב:**\n"
+                f"{video_url}\n\n"
+                "✨ המשימה הושלמה בהצלחה!"
+            ),
         )
-    return True, "נשלח לטלגרם בהצלחה."
+
+    return (
+        True,
+        "נשלח לטלגרם בהצלחה.",
+    )
 
 
-def run_pipeline(video_url: Optional[str] = None, speaker: Optional[str] = None):
-    """Main pipeline. Direct URL always bypasses speaker/date discovery."""
+def run_pipeline(
+    video_url: Optional[str] = None,
+    speaker: Optional[str] = None,
+):
+    """
+    Main pipeline.
+
+    Direct URL:
+        URL -> metadata -> transcript -> translation
+
+    Speaker:
+        latest video -> metadata -> transcript -> translation
+
+    IMPORTANT:
+    At no point is the YouTube video itself downloaded.
+    """
+
     try:
-        if video_url and video_url.strip():
-            video_url = video_url.strip()
-            extract_video_id(video_url)
-            title = get_video_title(video_url)
-        elif speaker in SPEAKER_URLS:
-            video_url, title = find_latest_friday_video(SPEAKER_URLS[speaker])
-            if not video_url:
-                return {"success": False, "message": f"לא נמצאה דרשה מתאימה עבור {speaker}."}
-        else:
-            return {"success": False, "message": "יש לבחור דרשן או להזין קישור YouTube."}
 
-        transcript = fetch_transcript(video_url)
-        translator = GeminiTranslator(os.getenv("GEMINI_API_KEY", ""))
-        translation = translator.translate_text(transcript)
+        if video_url and video_url.strip():
+
+            video_url = video_url.strip()
+
+            extract_video_id(
+                video_url
+            )
+
+            title = get_video_title(
+                video_url
+            )
+
+        elif speaker in SPEAKER_URLS:
+
+            video_url, title = (
+                find_latest_friday_video(
+                    SPEAKER_URLS[speaker]
+                )
+            )
+
+            if not video_url:
+                return {
+                    "success": False,
+                    "message": (
+                        "לא נמצא סרטון מתאים "
+                        f"עבור {speaker}."
+                    ),
+                }
+
+        else:
+
+            return {
+                "success": False,
+                "message": (
+                    "יש לבחור דרשן או להזין "
+                    "קישור YouTube."
+                ),
+            }
+
+        # Transcript only.
+        # No video download.
+        transcript = fetch_transcript(
+            video_url
+        )
+
+        translator = GeminiTranslator(
+            os.getenv(
+                "GEMINI_API_KEY",
+                "",
+            )
+        )
+
+        translation = (
+            translator.translate_text(
+                transcript
+            )
+        )
 
         telegram_ok = False
         telegram_message = ""
+
         try:
-            telegram_ok, telegram_message = asyncio.run(
-                send_to_telegram(translation, title, video_url)
+
+            telegram_ok, telegram_message = (
+                asyncio.run(
+                    send_to_telegram(
+                        translation,
+                        title,
+                        video_url,
+                    )
+                )
             )
+
         except Exception as exc:
-            telegram_message = f"שגיאה בטלגרם: {exc}"
+
+            telegram_message = (
+                f"שגיאה בטלגרם: {exc}"
+            )
 
         return {
             "success": True,
-            "message": f"התרגום הושלם. {telegram_message}",
+            "message": (
+                f"התרגום הושלם. "
+                f"{telegram_message}"
+            ),
             "video_url": video_url,
             "video_title": title,
             "translation": translation,
             "telegram_sent": telegram_ok,
         }
+
     except Exception as exc:
-        return {"success": False, "message": str(exc)}
+
+        return {
+            "success": False,
+            "message": str(exc),
+        }
