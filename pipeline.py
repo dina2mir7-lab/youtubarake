@@ -1,12 +1,13 @@
 import os
 import re
+import glob
 import time
 import asyncio
 import datetime
 import tempfile
 import requests
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -132,100 +133,68 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(url_or_id: str) -> str:
+    """מוריד את הכתוביות ישירות לקובץ זמני בדיסק בעזרת yt-dlp ומחלץ את הטקסט"""
     video_id = extract_video_id(url_or_id)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
     cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
     cookie_file_path = None
 
-    # יצירת קובץ cookies זמני מתוך משתנה הסביבה במידה וקיים
     if cookies_text:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
             cookie_file.write(cookies_text)
             cookie_file_path = cookie_file.name
 
-    ydl_opts = {
-        'skip_download': True,
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitleslangs': ['ar', 'he', 'en'],
-        # הוסר האילוץ ל-json3 כדי למנוע את השגיאה 'Requested format is not available'
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-        'geo_bypass': True,
-    }
+    with tempfile.TemporaryDirectory() as out_dir:
+        output_template = os.path.join(out_dir, '%(id)s')
 
-    if cookie_file_path:
-        ydl_opts['cookiefile'] = cookie_file_path
+        ydl_opts = {
+            'skip_download': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['ar', 'he', 'en'],
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            'geo_bypass': True,
+        }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            subtitles = info.get('subtitles') or info.get('automatic_captions')
+        if cookie_file_path:
+            ydl_opts['cookiefile'] = cookie_file_path
 
-            if not subtitles:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+
+            # חיפוש קובץ הכתוביות שירד לתיקייה (בפורמט vtt, json3 או ttml)
+            sub_files = glob.glob(os.path.join(out_dir, "*"))
+            if not sub_files:
                 raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
-            # 1. בחירת השפה הראשונה הזמינה
-            target_lang = None
-            for lang in ['ar', 'he', 'en']:
-                if lang in subtitles:
-                    target_lang = lang
-                    break
+            # קריאת הקובץ שירד
+            sub_file = sub_files[0]
+            with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
 
-            if not target_lang:
-                target_lang = list(subtitles.keys())[0]
-
-            sub_info = subtitles[target_lang]
-            sub_url = None
-            
-            # 2. ננסה למצוא קישור תקין (העדפה ל-json3, אם אין ניקח את הראשון שזמין למשל vtt/srv1)
-            for fmt in sub_info:
-                if fmt.get('ext') == 'json3':
-                    sub_url = fmt.get('url')
-                    break
-            if not sub_url and sub_info:
-                sub_url = sub_info[0].get('url')
-
-            if not sub_url:
-                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
-
-            # 3. הורדת תוכן הכתוביות
-            headers = {'User-Agent': ydl_opts['user_agent']}
-            resp = requests.get(sub_url, headers=headers)
-            
             transcript_lines = []
-            
-            # במידה והתקבל JSON (json3)
-            try:
-                data = resp.json()
-                for event in data.get('events', []):
-                    segs = event.get('segs')
-                    if segs:
-                        line_text = "".join(s.get('utf8', '') for s in segs if 'utf8' in s).strip()
-                        if line_text and line_text != '\n':
-                            transcript_lines.append(line_text)
-            except Exception:
-                # במידה והתקבל טקסט VTT/SRT רגיל - ניקוי פשוט של קוד מזהה/זמנים
-                raw_text = resp.text
-                for line in raw_text.splitlines():
-                    line = line.strip()
-                    # סינון שורות כותרת, זמנים ושורות ריקות של VTT
-                    if line and not line.startswith("WEBVTT") and not line.startswith("Kind:") and not line.startswith("Language:") and "-->" not in line and not line.isdigit():
-                        # מניעת כפילויות רצופות
-                        if not transcript_lines or transcript_lines[-1] != line:
-                            transcript_lines.append(line)
+            # ניקוי שורות במידה וזה קובץ VTT/SRT
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("WEBVTT") and not line.startswith("Kind:") and not line.startswith("Language:") and "-->" not in line and not line.isdigit():
+                    if not transcript_lines or transcript_lines[-1] != line:
+                        transcript_lines.append(line)
 
             if not transcript_lines:
                 raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
             return "\n".join(transcript_lines)
-            
-    finally:
-        if cookie_file_path and os.path.exists(cookie_file_path):
-            os.remove(cookie_file_path)
+
+        finally:
+            if cookie_file_path and os.path.exists(cookie_file_path):
+                os.remove(cookie_file_path)
+
 
 def split_text(text, max_chars):
     chunks = []
@@ -328,7 +297,7 @@ def run_pipeline(video_url: str = None, speaker: str = None):
     if not video_url:
         return {"success": False, "message": "לא סופק קישור תקין ליוטיוב."}
 
-    # שימוש בתיקייה זמנית של מערכת ההפעלה (מתאים לענן)
+    # שימוש בתיקייה זמנית של מערכת ההפעלה
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             video_id = extract_video_id(video_url)
@@ -356,9 +325,16 @@ def run_pipeline(video_url: str = None, speaker: str = None):
         with open(translated_file, "r", encoding="utf-8") as f:
             full_translated_text = f.read()
 
-        # 3. שליחה לטלגרם דרך Telethon
+        # 3. שליחה לטלגרם דרך Telethon (הרצה בטוחה בתוך Loop קיים)
         try:
-            asyncio.run(send_to_telegram(full_translated_text, video_title, video_url))
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(send_to_telegram(full_translated_text, video_title, video_url))
+                else:
+                    loop.run_until_complete(send_to_telegram(full_translated_text, video_title, video_url))
+            except RuntimeError:
+                asyncio.run(send_to_telegram(full_translated_text, video_title, video_url))
         except Exception as e:
             print(f"⚠️ שגיאה במהלך שליחה לטלגרם: {e}")
 
