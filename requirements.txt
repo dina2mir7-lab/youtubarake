@@ -5,3 +5,4 @@ yt-dlp>=2025.01.15
 google-genai>=1.30,<2
 telethon>=1.41,<2
 pydantic>=2.8,<3
+youtube-transcript-api
