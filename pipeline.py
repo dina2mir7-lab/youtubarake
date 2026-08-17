@@ -1,310 +1,394 @@
-import os
-import re
-import time
 import asyncio
 import datetime
+import os
+import re
 import tempfile
+from pathlib import Path
+from typing import Optional
+
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-
-# ייבוא Telethon עבור התחברות דרך StringSession
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# הגדרות כלליות
-MAX_TELEGRAM_CHARS = 4000
-MAX_VIDEOS_TO_SCAN = 15
+MAX_TELEGRAM_CHARS = int(os.getenv("MAX_TELEGRAM_CHARS", "4000"))
+MAX_VIDEOS_TO_SCAN = int(os.getenv("MAX_VIDEOS_TO_SCAN", "20"))
 
-# קישורים לערוצים/פלייליסטים
 SPEAKER_URLS = {
-    "salah": "https://www.youtube.com/playlist?list=PLWrMpoT7k1QikW0C0172oQ6HwmODp-ML2",
-    "khateb": "https://www.youtube.com/@KamalKhateb/videos"
+    "salah": os.getenv(
+        "SALAH_URL",
+        "https://www.youtube.com/playlist?list=PLWrMpoT7k1QikW0C0172oQ6HwmODp-ML2",
+    ),
+    "khateb": os.getenv(
+        "KHATEB_URL",
+        "https://www.youtube.com/@KamalKhateb/videos",
+    ),
 }
 
-
-# ==========================================
-# שליחה לטלגרם באמצעות Telethon (StringSession)
-# ==========================================
-async def send_to_telegram(full_text: str, video_title: str, video_url: str):
-    api_id_env = os.getenv("TELEGRAM_API_ID")
-    api_hash = os.getenv("TELEGRAM_API_HASH")
-    session_str = os.getenv("TELEGRAM_SESSION_STRING")
-    target_user = os.getenv("TELEGRAM_TARGET_USER")
-
-    if not all([api_id_env, api_hash, session_str, target_user]):
-        print("⚠️ משתני סביבה של טלגרם חסרים. הודעה לא תישלח לטלגרם.")
-        return
-
-    api_id = int(api_id_env)
-    text_chunks = split_text(full_text, MAX_TELEGRAM_CHARS)
-
-    async with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
-        header_msg = f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\nהתוכן מתחיל מטה 👇"
-        await client.send_message(target_user, header_msg)
-        await asyncio.sleep(1.0)
-
-        for index, chunk in enumerate(text_chunks, 1):
-            await client.send_message(target_user, chunk)
-            await asyncio.sleep(1.2)
-
-        footer_msg = f"🔗 **קישור לסרטון המקורי ביוטיוב:**\n{video_url}\n\n✨ המשימה הושלמה בהצלחה!"
-        await client.send_message(target_user, footer_msg)
+LANGUAGES = ["ar", "he", "en"]
 
 
-# ==========================================
-# איתור סרטונים וחילוץ
-# ==========================================
+def _cookie_file_from_env():
+    """Return (path, temporary). Supports a server file or Netscape cookies text."""
+    explicit = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit, False
+
+    text = os.getenv("YOUTUBE_COOKIES_TEXT", "")
+    if text.strip():
+        f = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8")
+        f.write(text)
+        f.close()
+        return f.name, True
+
+    return None, False
+
+
+def _youtube_opts(extra=None):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 3,
+        "noplaylist": True,
+    }
+    cookie_file, temporary = _cookie_file_from_env()
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+    if extra:
+        opts.update(extra)
+    return opts, cookie_file, temporary
+
+
+def _cleanup_cookie(cookie_file, temporary):
+    if temporary and cookie_file:
+        try:
+            os.remove(cookie_file)
+        except OSError:
+            pass
+
+
 def get_target_dates_strings():
     today = datetime.date.today()
     days_to_subtract = (today.weekday() - 4) % 7
     last_friday = today - datetime.timedelta(days=days_to_subtract)
     last_saturday = last_friday + datetime.timedelta(days=1)
 
-    separators = ['.', '/', '-']
+    separators = [".", "/", "-"]
     date_formats = set()
 
-    def add_date_combinations(target_date):
-        days = [str(target_date.day), target_date.strftime('%d')]
-        months = [str(target_date.month), target_date.strftime('%m')]
+    for target_date in (last_friday, last_saturday):
+        days = [str(target_date.day), target_date.strftime("%d")]
+        months = [str(target_date.month), target_date.strftime("%m")]
         years = [str(target_date.year), str(target_date.year)[2:]]
         for d in days:
             for m in months:
                 for y in years:
                     for sep in separators:
                         date_formats.add(f"{d}{sep}{m}{sep}{y}")
-
-    add_date_combinations(last_friday)
-    add_date_combinations(last_saturday)
-    return list(date_formats)
+    return date_formats
 
 
-def find_latest_friday_video(url, max_videos=15):
+def find_latest_friday_video(url: str, max_videos: int = MAX_VIDEOS_TO_SCAN):
+    """Scan the configured channel/playlist and select a Friday/Saturday video by title."""
     target_dates = get_target_dates_strings()
-    ydl_opts = {
-        'extract_flat': True,
-        'skip_download': True,
-        'playlistend': max_videos,
-        'ignoreerrors': True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            result_dict = ydl.extract_info(url, download=False)
-            if not result_dict:
+    opts, cookie_file, temporary = _youtube_opts(
+        {
+            "extract_flat": True,
+            "skip_download": True,
+            "playlistend": max_videos,
+        }
+    )
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
                 return None, None
 
-            videos = result_dict.get('entries', [])
-            if not videos and 'title' in result_dict:
-                videos = [result_dict]
+            entries = info.get("entries") or []
+            if not entries and info.get("id"):
+                entries = [info]
 
-            for video in videos:
+            for video in entries:
                 if not video:
                     continue
-                title = video.get('title') or ''
-                v_id = video.get('id') or video.get('video_id')
-                if not v_id:
+                title = video.get("title") or ""
+                video_id = video.get("id") or video.get("video_id")
+                if not video_id:
                     continue
-
-                video_url = f"https://www.youtube.com/watch?v={v_id}"
-                if any(target_date in title for target_date in target_dates):
-                    return video_url, title
+                if any(d in title for d in target_dates):
+                    return f"https://www.youtube.com/watch?v={video_id}", title
 
             return None, None
-        except Exception as e:
-            print(f"⚠️ שגיאה בסריקת יוטיוב: {e}")
-            return None, None
+    finally:
+        _cleanup_cookie(cookie_file, temporary)
 
 
 def extract_video_id(url_or_id: str) -> str:
-    patterns = [r"(?:v=)([a-zA-Z0-9_-]{11})", r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})", r"^([a-zA-Z0-9_-]{11})$"]
+    value = url_or_id.strip()
+    patterns = [
+        r"(?:v=)([A-Za-z0-9_-]{11})",
+        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
+        r"(?:youtube\.com/(?:shorts|embed|live)/)([A-Za-z0-9_-]{11})",
+        r"^([A-Za-z0-9_-]{11})$",
+    ]
     for pattern in patterns:
-        match = re.search(pattern, url_or_id)
+        match = re.search(pattern, value)
         if match:
             return match.group(1)
-    raise ValueError(f"לא ניתן לחלץ Video ID מ: {url_or_id}")
+    raise ValueError("לא ניתן לזהות Video ID מתוך קישור YouTube שסופק.")
 
 
-def fetch_transcript(url_or_id: str) -> str:
-    """חילוץ כתוביות ישיר, ממוקד ונקי באמצעות YouTubeTranscriptApi.get_transcript"""
-    video_id = extract_video_id(url_or_id)
-    cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
-    cookie_file_path = None
+def _clean_vtt(vtt_text: str) -> str:
+    """Convert VTT into readable text and remove duplicate caption lines."""
+    text = vtt_text.replace("\ufeff", "")
+    lines = text.splitlines()
+    result = []
+    previous = None
 
-    # יצירת קובץ עוגיות זמני במידה ומוגדר ב-Render
-    if cookies_text:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
-            cookie_file.write(cookies_text)
-            cookie_file_path = cookie_file.name
-
-    try:
-        # הקריאה הרישמית והיציבה של הספרייה
-        if cookie_file_path:
-            transcript_list = YouTubeTranscriptApi.get_transcript(
-                video_id, 
-                languages=["ar", "he", "en"], 
-                cookies=cookie_file_path
-            )
-        else:
-            transcript_list = YouTubeTranscriptApi.get_transcript(
-                video_id, 
-                languages=["ar", "he", "en"]
-            )
-
-        # הרכבת הטקסט מתוך רשימת המילונים
-        return "\n".join(item["text"] for item in transcript_list)
-
-    finally:
-        if cookie_file_path and os.path.exists(cookie_file_path):
-            os.remove(cookie_file_path)
-
-
-def split_text(text, max_chars):
-    chunks = []
-    current_chunk = ""
-    lines = text.split("\n")
-
-    for line in lines:
-        if len(line) > max_chars:
-            for i in range(0, len(line), max_chars):
-                chunks.append(line[i: i + max_chars])
+    for raw in lines:
+        line = raw.strip()
+        if not line:
             continue
+        if line == "WEBVTT" or line.startswith("NOTE"):
+            continue
+        if re.match(r"^\d+$", line):
+            continue
+        if "-->" in line:
+            continue
+        # Remove common VTT markup.
+        line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", "", line)
+        line = re.sub(r"</?c(?:\.[^>]*)?>", "", line)
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"&amp;", "&", line)
+        line = re.sub(r"&lt;", "<", line)
+        line = re.sub(r"&gt;", ">", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        if line != previous:
+            result.append(line)
+            previous = line
 
-        if len(current_chunk) + len(line) + 1 > max_chars:
-            chunks.append(current_chunk.strip())
-            current_chunk = line + "\n"
-        else:
-            current_chunk += line + "\n"
-
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-
-    return chunks
+    return "\n".join(result)
 
 
-# ==========================================
-# Gemini Translator
-# ==========================================
+def fetch_transcript(video_url: str) -> str:
+    """Download YouTube captions through yt-dlp, using cookies when supplied."""
+    video_id = extract_video_id(video_url)
+    with tempfile.TemporaryDirectory(prefix=f"yt_{video_id}_") as workdir:
+        outtmpl = str(Path(workdir) / "caption.%(ext)s")
+        opts, cookie_file, temporary = _youtube_opts(
+            {
+                "skip_download": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": LANGUAGES,
+                "subtitlesformat": "vtt",
+                "outtmpl": outtmpl,
+            }
+        )
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+                if not info:
+                    raise RuntimeError("YouTube לא החזיר מידע על הסרטון.")
+
+                # download subtitles only; no video is downloaded
+                ydl.download([video_url])
+
+            candidates = sorted(Path(workdir).glob("*.vtt"))
+            if not candidates:
+                raise RuntimeError(
+                    "לא נמצאו כתוביות/טרנסקריפט לסרטון. אם הסרטון מוגן, ודא שקובץ cookies.txt תקין ומעודכן."
+                )
+
+            # Prefer Arabic, then Hebrew, then English.
+            def score(path):
+                name = path.name.lower()
+                return next((i for i, lang in enumerate(LANGUAGES) if f".{lang}." in name), 99)
+
+            candidates.sort(key=score)
+            transcript = _clean_vtt(candidates[0].read_text(encoding="utf-8", errors="replace"))
+            if not transcript.strip():
+                raise RuntimeError("קובץ הכתוביות נמצא אך הוא ריק.")
+            return transcript
+        finally:
+            _cleanup_cookie(cookie_file, temporary)
+
+
+def get_video_title(video_url: str) -> str:
+    opts, cookie_file, temporary = _youtube_opts({"skip_download": True})
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            return (info or {}).get("title") or "סרטון יוטיוב"
+    finally:
+        _cleanup_cookie(cookie_file, temporary)
+
+
 class GeminiTranslator:
     def __init__(self, api_key: str):
         if not api_key:
-            raise ValueError("❌ מפתח API של Gemini חסר!")
+            raise ValueError("GEMINI_API_KEY חסר ב-Environment Variables.")
         self.client = genai.Client(api_key=api_key)
-        self.primary_model = "gemini-2.5-flash"
-        self.fallback_model = "gemini-3.1-flash-lite"
+        self.models = [
+            os.getenv("GEMINI_PRIMARY_MODEL", "gemini-2.5-flash"),
+            os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite"),
+        ]
 
-    def translate_large_file(self, input_file_path: str, output_file_path: str) -> bool:
-        if not os.path.exists(input_file_path):
-            return False
-
-        uploaded_file = self.client.files.upload(file=input_file_path)
+    def translate_text(self, text: str) -> str:
+        """Translate the complete transcript. For long transcripts, process safe chunks."""
+        # Keep chunks comfortably below common request limits.
+        chunk_size = int(os.getenv("TRANSLATION_CHUNK_CHARS", "45000"))
+        chunks = split_text(text, chunk_size)
+        translated = []
 
         system_instruction = (
-            "אתה מתרגם מקצועי ומומחה לשפה הערבית והעברית. תפקידך לתרגם את קובץ הטקסט המצורף מערבית לעברית.\n"
-            "מדובר בתמלול של דרשה. טקסט המקור עשוי להכיל שבירות שורה קצרות - חובה להתעלם מהן ולחבר את המשפטים לרצף אחד.\n"
-            "דגשים:\n"
-            "1. תרגום מלא ומדויק מילה במילה.\n"
-            "2. משלב שפה גבוה, מכובד ורהוט.\n"
-            "3. פסקאות רציפות. אל תוסיף הערות או הקדמות."
+            "אתה מתרגם מקצועי ומומחה לשפה הערבית והעברית. "
+            "תרגם את התמלול מערבית לעברית. מדובר בתמלול של דרשה. "
+            "התמלול עשוי להכיל שבירות שורה קצרות שנוצרו מאופי הכתוביות; התעלם מהן וחבר את המשפטים לרצף טבעי.\n"
+            "כללים מחייבים:\n"
+            "1. תרגום מלא ומדויק. אין לסכם, לקצר, להשמיט או להוסיף תוכן.\n"
+            "2. שמור על משמעות המקור, שמות, מונחים וציטוטים ככל שניתן.\n"
+            "3. עברית גבוהה, מכובדת, רהוטה וטבעית המתאימה לדרשה.\n"
+            "4. החזר פסקאות רציפות ולא שורה חדשה אחרי כל משפט.\n"
+            "5. אל תוסיף הערות, הקדמות, הסברים או כותרות משלך.\n"
+            "6. החזר אך ורק את התרגום."
         )
 
-        models_to_try = [self.primary_model, self.fallback_model]
-        
-        try:
-            for current_model in models_to_try:
+        for index, chunk in enumerate(chunks):
+            prompt = (
+                "תרגם את החלק הבא במלואו. "
+                "זהו חלק מתוך תמלול ארוך, לכן אל תסכם ואל תדלג על דבר.\n\n" + chunk
+            )
+            result = None
+            last_error = None
+            for model in self.models:
                 for attempt in range(1, 4):
                     try:
                         response = self.client.models.generate_content(
-                            model=current_model,
-                            contents=[uploaded_file, "אנא תרגם את כל הקובץ המצורף לפי ההנחיות."],
+                            model=model,
+                            contents=[prompt],
                             config=types.GenerateContentConfig(
                                 system_instruction=system_instruction,
-                                temperature=0.3,
-                            )
+                                temperature=0.2,
+                            ),
                         )
-                        if response.text:
-                            with open(output_file_path, "w", encoding="utf-8") as f:
-                                f.write(response.text)
-                            return True
-                    except APIError as e:
-                        if e.code in (429, 503) or "RESOURCE_EXHAUSTED" in str(e):
-                            time.sleep(20)
-                        else:
+                        if response.text and response.text.strip():
+                            result = response.text.strip()
                             break
-                    except Exception:
+                    except APIError as exc:
+                        last_error = exc
+                        code = getattr(exc, "code", None)
+                        if code in (429, 500, 502, 503, 504) or any(
+                            x in str(exc).upper() for x in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "TIMEOUT")
+                        ):
+                            time_sleep = min(60, 5 * (2 ** (attempt - 1)))
+                            import time
+                            time.sleep(time_sleep)
+                            continue
                         break
-            return False
-        finally:
-            try:
-                self.client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+                    except Exception as exc:
+                        last_error = exc
+                        break
+                if result:
+                    break
+
+            if not result:
+                raise RuntimeError(f"Gemini נכשל בתרגום חלק {index + 1}/{len(chunks)}: {last_error}")
+            translated.append(result)
+
+        return "\n\n".join(translated)
 
 
-# ==========================================
-# הצינור הראשי
-# ==========================================
-def run_pipeline(video_url: str = None, speaker: str = None):
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    video_title = "סרטון יוטיוב"
+def split_text(text: str, max_chars: int):
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks = []
+    current = ""
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            for i in range(0, len(paragraph), max_chars):
+                chunks.append(paragraph[i:i + max_chars].strip())
+            continue
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) > max_chars:
+            chunks.append(current.strip())
+            current = paragraph
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks
 
-    # איתור קישור לפי דרשן במידת הצורך
-    if not video_url and speaker in SPEAKER_URLS:
-        target_channel_url = SPEAKER_URLS[speaker]
-        found_url, found_title = find_latest_friday_video(target_channel_url, max_videos=MAX_VIDEOS_TO_SCAN)
-        if not found_url:
-            return {"success": False, "message": f"לא נמצאה דרשה מתאימה ליום שישי האחרון עבור {speaker}."}
-        video_url = found_url
-        video_title = found_title
 
-    if not video_url:
-        return {"success": False, "message": "לא סופק קישור תקין ליוטיוב."}
+async def send_to_telegram(full_text: str, video_title: str, video_url: str):
+    api_id_env = os.getenv("TELEGRAM_API_ID")
+    api_hash = os.getenv("TELEGRAM_API_HASH")
+    session_str = os.getenv("TELEGRAM_SESSION_STRING")
+    target_user = os.getenv("TELEGRAM_TARGET_USER")
+    if not all([api_id_env, api_hash, session_str, target_user]):
+        return False, "משתני טלגרם חסרים; התרגום הושלם אך לא נשלח לטלגרם."
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    api_id = int(api_id_env)
+    chunks = split_text(full_text, MAX_TELEGRAM_CHARS)
+    async with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
+        await client.send_message(
+            target_user,
+            f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\nהתוכן מתחיל מטה 👇",
+        )
+        for chunk in chunks:
+            await client.send_message(target_user, chunk)
+            await asyncio.sleep(1.1)
+        await client.send_message(
+            target_user,
+            f"🔗 **קישור לסרטון המקורי ביוטיוב:**\n{video_url}\n\n✨ המשימה הושלמה בהצלחה!",
+        )
+    return True, "נשלח לטלגרם בהצלחה."
+
+
+def run_pipeline(video_url: Optional[str] = None, speaker: Optional[str] = None):
+    """Main pipeline. Direct URL always bypasses speaker/date discovery."""
+    try:
+        if video_url and video_url.strip():
+            video_url = video_url.strip()
+            extract_video_id(video_url)
+            title = get_video_title(video_url)
+        elif speaker in SPEAKER_URLS:
+            video_url, title = find_latest_friday_video(SPEAKER_URLS[speaker])
+            if not video_url:
+                return {"success": False, "message": f"לא נמצאה דרשה מתאימה עבור {speaker}."}
+        else:
+            return {"success": False, "message": "יש לבחור דרשן או להזין קישור YouTube."}
+
+        transcript = fetch_transcript(video_url)
+        translator = GeminiTranslator(os.getenv("GEMINI_API_KEY", ""))
+        translation = translator.translate_text(transcript)
+
+        telegram_ok = False
+        telegram_message = ""
         try:
-            video_id = extract_video_id(video_url)
-        except ValueError as e:
-            return {"success": False, "message": str(e)}
-
-        original_file = os.path.join(temp_dir, f"transcript_{video_id}_orig.txt")
-        translated_file = os.path.join(temp_dir, f"transcript_{video_id}_trans.txt")
-
-        # 1. חילוץ טרנסקריפט
-        try:
-            transcript_text = fetch_transcript(video_url)
-            with open(original_file, "w", encoding="utf-8") as f:
-                f.write(transcript_text)
-        except (TranscriptsDisabled, NoTranscriptFound):
-            return {"success": False, "message": "לא נמצאו כתוביות זמינות לסרטון זה."}
-        except Exception as e:
-            return {"success": False, "message": f"שגיאה בחילוץ הטרנסקריפט: {e}"}
-
-        # 2. תרגום
-        translator = GeminiTranslator(api_key=gemini_key)
-        if not translator.translate_large_file(original_file, translated_file):
-            return {"success": False, "message": "תרגום הקובץ באמצעות Gemini נכשל."}
-
-        with open(translated_file, "r", encoding="utf-8") as f:
-            full_translated_text = f.read()
-
-        # 3. שליחה לטלגרם
-        try:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(send_to_telegram(full_translated_text, video_title, video_url))
-                else:
-                    loop.run_until_complete(send_to_telegram(full_translated_text, video_title, video_url))
-            except RuntimeError:
-                asyncio.run(send_to_telegram(full_translated_text, video_title, video_url))
-        except Exception as e:
-            print(f"⚠️ שגיאה במהלך שליחה לטלגרם: {e}")
+            telegram_ok, telegram_message = asyncio.run(
+                send_to_telegram(translation, title, video_url)
+            )
+        except Exception as exc:
+            telegram_message = f"שגיאה בטלגרם: {exc}"
 
         return {
             "success": True,
-            "message": "הפייפליין הושלם בהצלחה!",
+            "message": f"התרגום הושלם. {telegram_message}",
             "video_url": video_url,
-            "translation": full_translated_text
+            "video_title": title,
+            "translation": translation,
+            "telegram_sent": telegram_ok,
         }
+    except Exception as exc:
+        return {"success": False, "message": str(exc)}
