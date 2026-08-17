@@ -149,7 +149,7 @@ def fetch_transcript(url_or_id: str) -> str:
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': ['ar', 'he', 'en'],
-        'subtitlesformat': 'json3',
+        # הוסר האילוץ ל-json3 כדי למנוע את השגיאה 'Requested format is not available'
         'quiet': True,
         'no_warnings': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -168,6 +168,7 @@ def fetch_transcript(url_or_id: str) -> str:
             if not subtitles:
                 raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
+            # 1. בחירת השפה הראשונה הזמינה
             target_lang = None
             for lang in ['ar', 'he', 'en']:
                 if lang in subtitles:
@@ -179,6 +180,8 @@ def fetch_transcript(url_or_id: str) -> str:
 
             sub_info = subtitles[target_lang]
             sub_url = None
+            
+            # 2. ננסה למצוא קישור תקין (העדפה ל-json3, אם אין ניקח את הראשון שזמין למשל vtt/srv1)
             for fmt in sub_info:
                 if fmt.get('ext') == 'json3':
                     sub_url = fmt.get('url')
@@ -189,23 +192,40 @@ def fetch_transcript(url_or_id: str) -> str:
             if not sub_url:
                 raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
+            # 3. הורדת תוכן הכתוביות
             headers = {'User-Agent': ydl_opts['user_agent']}
             resp = requests.get(sub_url, headers=headers)
-            data = resp.json()
-
+            
             transcript_lines = []
-            for event in data.get('events', []):
-                segs = event.get('segs')
-                if segs:
-                    line_text = "".join(s.get('utf8', '') for s in segs if 'utf8' in s).strip()
-                    if line_text and line_text != '\n':
-                        transcript_lines.append(line_text)
+            
+            # במידה והתקבל JSON (json3)
+            try:
+                data = resp.json()
+                for event in data.get('events', []):
+                    segs = event.get('segs')
+                    if segs:
+                        line_text = "".join(s.get('utf8', '') for s in segs if 'utf8' in s).strip()
+                        if line_text and line_text != '\n':
+                            transcript_lines.append(line_text)
+            except Exception:
+                # במידה והתקבל טקסט VTT/SRT רגיל - ניקוי פשוט של קוד מזהה/זמנים
+                raw_text = resp.text
+                for line in raw_text.splitlines():
+                    line = line.strip()
+                    # סינון שורות כותרת, זמנים ושורות ריקות של VTT
+                    if line and not line.startswith("WEBVTT") and not line.startswith("Kind:") and not line.startswith("Language:") and "-->" not in line and not line.isdigit():
+                        # מניעת כפילויות רצופות
+                        if not transcript_lines or transcript_lines[-1] != line:
+                            transcript_lines.append(line)
+
+            if not transcript_lines:
+                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
             return "\n".join(transcript_lines)
+            
     finally:
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
-
 
 def split_text(text, max_chars):
     chunks = []
