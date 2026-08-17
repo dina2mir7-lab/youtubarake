@@ -3,189 +3,83 @@ import datetime
 import os
 import re
 import time
-import traceback
 from typing import Optional
 
 import yt_dlp
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-)
+from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
 )
 
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
-
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-
-
-# ============================================================
-# הגדרות
-# ============================================================
-
-MAX_TELEGRAM_CHARS = int(
-    os.getenv("MAX_TELEGRAM_CHARS", "4000")
-)
-
-MAX_VIDEOS_TO_SCAN = int(
-    os.getenv("MAX_VIDEOS_TO_SCAN", "20")
-)
-
-LANGUAGES = ["ar", "he", "en"]
-
-
-# ============================================================
-# כתובות הדרשנים
-# ============================================================
+MAX_TELEGRAM_CHARS = int(os.getenv("MAX_TELEGRAM_CHARS", "4000"))
+MAX_VIDEOS_TO_SCAN = int(os.getenv("MAX_VIDEOS_TO_SCAN", "20"))
 
 SPEAKER_URLS = {
     "salah": os.getenv(
         "SALAH_URL",
         "https://www.youtube.com/playlist?list=PLWrMpoT7k1QikW0C0172oQ6HwmODp-ML2",
     ),
-
     "khateb": os.getenv(
         "KHATEB_URL",
         "https://www.youtube.com/@KamalKhateb/videos",
     ),
 }
 
+LANGUAGES = ["ar", "he", "en"]
+
 
 # ============================================================
-# Cookies עבור YouTube
+# YouTube
 # ============================================================
-
-def _cookie_file_from_env():
-    """
-    מחזיר:
-        (path, temporary)
-
-    תומך בשתי אפשרויות:
-    1. קובץ cookies.txt קיים בשרת
-    2. טקסט cookies מתוך Environment Variable
-    """
-
-    explicit = os.getenv(
-        "YOUTUBE_COOKIES_FILE",
-        ""
-    ).strip()
-
-    if explicit and os.path.exists(explicit):
-        return explicit, False
-
-    text = os.getenv(
-        "YOUTUBE_COOKIES_TEXT",
-        ""
-    )
-
-    if text.strip():
-
-        import tempfile
-
-        f = tempfile.NamedTemporaryFile(
-            "w",
-            delete=False,
-            suffix=".txt",
-            encoding="utf-8",
-        )
-
-        f.write(text)
-        f.close()
-
-        return f.name, True
-
-    return None, False
-
 
 def _youtube_opts(extra=None):
     """
-    הגדרות yt-dlp.
-
+    הגדרות YouTube.
     חשוב:
-    yt-dlp משמש כאן רק לצורך איתור הסרטון.
-    אין הורדת וידאו.
+    אנחנו לא מורידים וידאו.
+    extract_flat משמש רק כאשר אנחנו סורקים רשימת סרטונים.
     """
 
     opts = {
-        "quiet": True,
-        "no_warnings": True,
-
-        # לא להפיל את כל הסריקה בגלל סרטון אחד בעייתי
+        "quiet": False,
+        "no_warnings": False,
         "ignoreerrors": True,
-
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 3,
-
-        # חשוב מאוד:
-        # כשאנחנו סורקים playlist אנחנו לא רוצים
-        # להיכנס לכל סרטון ולהוריד אותו.
-        "noplaylist": False,
-
-        # איתור metadata בלבד
-        "extract_flat": True,
-        "skip_download": True,
+        "noplaylist": True,
     }
-
-    cookie_file, temporary = _cookie_file_from_env()
-
-    if cookie_file:
-        opts["cookiefile"] = cookie_file
 
     if extra:
         opts.update(extra)
 
-    return opts, cookie_file, temporary
+    return opts
 
-
-def _cleanup_cookie(cookie_file, temporary):
-
-    if temporary and cookie_file:
-
-        try:
-            os.remove(cookie_file)
-
-        except OSError:
-            pass
-
-
-# ============================================================
-# חישוב תאריכי שישי ושבת
-# ============================================================
 
 def get_target_dates_strings():
+    """
+    מחשב את יום שישי והשבת האחרונים
+    ומחזיר את כל צורות הכתיבה הסבירות שלהם.
+    """
 
     today = datetime.date.today()
 
-    # יום שישי = 4
-    days_to_subtract = (
-        today.weekday() - 4
-    ) % 7
-
-    last_friday = (
-        today
-        - datetime.timedelta(
-            days=days_to_subtract
-        )
-    )
-
-    last_saturday = (
-        last_friday
-        + datetime.timedelta(days=1)
-    )
+    days_to_subtract = (today.weekday() - 4) % 7
+    last_friday = today - datetime.timedelta(days=days_to_subtract)
+    last_saturday = last_friday + datetime.timedelta(days=1)
 
     separators = [".", "/", "-"]
-
     date_formats = set()
 
     def add_date_combinations(target_date):
-
         days = [
             str(target_date.day),
             target_date.strftime("%d"),
@@ -204,145 +98,83 @@ def get_target_dates_strings():
         for d in days:
             for m in months:
                 for y in years:
-
                     for sep in separators:
-
-                        date_formats.add(
-                            f"{d}{sep}{m}{sep}{y}"
-                        )
+                        date_formats.add(f"{d}{sep}{m}{sep}{y}")
 
     add_date_combinations(last_friday)
     add_date_combinations(last_saturday)
 
-    return list(date_formats)
+    return date_formats
 
-
-# ============================================================
-# איתור הדרשה האחרונה
-# ============================================================
 
 def find_latest_friday_video(
-    url,
-    max_videos=MAX_VIDEOS_TO_SCAN,
+    url: str,
+    max_videos: int = MAX_VIDEOS_TO_SCAN,
 ):
     """
-    סורק את הערוץ/playlist ומאתר סרטון שהכותרת שלו
-    מכילה תאריך של יום שישי או שבת האחרונים.
+    סורק את רשימת הסרטונים.
 
-    חשוב:
-    כאן בלבד אנחנו משתמשים ב-yt-dlp.
+    עדיפות:
+    1. סרטון שמכיל בכותרת את תאריך שישי/שבת האחרונים.
+    2. אם לא נמצא כזה — הסרטון הראשון ברשימה.
 
-    אין הורדת וידאו.
+    כך המערכת לא נעצרת כאשר הדרשה האחרונה
+    לא מכילה תאריך בכותרת.
     """
 
     target_dates = get_target_dates_strings()
 
-    print()
-    print("=" * 70)
-    print("🔎 איתור הדרשה האחרונה")
-    print("=" * 70)
+    today = datetime.date.today()
 
-    print(
-        f"📅 היום: "
-        f"{datetime.date.today().strftime('%d.%m.%Y')}"
+    print("=" * 80)
+    print("[YOUTUBE] START SEARCH")
+    print(f"[YOUTUBE] URL: {url}")
+    print(f"[YOUTUBE] Today: {today.strftime('%d.%m.%Y')}")
+    print(f"[YOUTUBE] Scanning up to {max_videos} videos")
+    print("=" * 80)
+
+    ydl_opts = _youtube_opts(
+        {
+            "extract_flat": True,
+            "skip_download": True,
+            "playlistend": max_videos,
+        }
     )
-
-    print(
-        f"🔍 בודק תאריכים של שישי/שבת האחרונים"
-    )
-
-    print(
-        f"📊 מספר קומבינציות תאריך: "
-        f"{len(target_dates)}"
-    )
-
-    print(
-        f"🔄 סריקה של עד {max_videos} סרטונים"
-    )
-
-    print(
-        f"🔗 מקור: {url}"
-    )
-
-    print("-" * 70)
-
-    ydl_opts = {
-        "extract_flat": True,
-        "skip_download": True,
-        "playlistend": max_videos,
-        "ignoreerrors": True,
-        "noplaylist": False,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    cookie_file, temporary = _cookie_file_from_env()
-
-    if cookie_file:
-        ydl_opts["cookiefile"] = cookie_file
 
     try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
 
-        with yt_dlp.YoutubeDL(
-            ydl_opts
-        ) as ydl:
+            print("[YOUTUBE] Requesting video list...")
 
-            try:
-
-                result_dict = ydl.extract_info(
-                    url,
-                    download=False,
-                )
-
-            except Exception as e:
-
-                print(
-                    f"⚠️ שגיאה בסריקת YouTube: {e}"
-                )
-
-                traceback.print_exc()
-
-                return None, None
+            result_dict = ydl.extract_info(
+                url,
+                download=False,
+            )
 
             if not result_dict:
-
-                print(
-                    "❌ לא התקבל מידע מהקישור."
-                )
-
+                print("[YOUTUBE] ERROR: no result returned.")
                 return None, None
 
-            videos = (
-                result_dict.get("entries")
-                or []
-            )
+            entries = result_dict.get("entries") or []
 
-            if (
-                not videos
-                and result_dict.get("title")
-            ):
+            # במקרה שהקישור הוא סרטון בודד
+            if not entries and result_dict.get("id"):
+                entries = [result_dict]
 
-                videos = [
-                    result_dict
-                ]
+            print(f"[YOUTUBE] Received {len(entries)} entries.")
 
-            print(
-                f"📋 נמצאו "
-                f"{len(videos)} פריטים לסריקה."
-            )
+            if not entries:
+                print("[YOUTUBE] ERROR: no videos found.")
+                return None, None
 
-            for index, video in enumerate(
-                videos,
-                start=1,
-            ):
+            first_valid_video = None
+
+            for index, video in enumerate(entries, start=1):
 
                 if not video:
                     continue
 
-                title = (
-                    video.get("title")
-                    or ""
-                )
+                title = video.get("title") or ""
 
                 video_id = (
                     video.get("id")
@@ -350,144 +182,140 @@ def find_latest_friday_video(
                 )
 
                 if not video_id:
+                    print(f"[YOUTUBE] #{index}: missing video ID")
                     continue
 
                 video_url = (
-                    "https://www.youtube.com/watch?v="
-                    + video_id
+                    f"https://www.youtube.com/watch?v={video_id}"
                 )
 
-                print()
                 print(
-                    f"#{index}: {title}"
+                    f"[YOUTUBE] #{index}: {title}"
                 )
 
-                if any(
-                    target_date in title
-                    for target_date in target_dates
-                ):
-
-                    print(
-                        "🎉 נמצא הסרטון המתאים!"
-                    )
-
-                    print(
-                        f"   📌 כותרת: {title}"
-                    )
-
-                    print(
-                        f"   🔗 קישור: {video_url}"
-                    )
-
-                    return (
+                # שומרים את הסרטון הראשון כ-fallback
+                if first_valid_video is None:
+                    first_valid_video = (
                         video_url,
                         title,
                     )
 
-            print()
+                # בדיקת תאריך
+                if any(
+                    target_date in title
+                    for target_date in target_dates
+                ):
+                    print()
+                    print(
+                        "[YOUTUBE] MATCH FOUND - "
+                        "Friday/Saturday date detected"
+                    )
+                    print(f"[YOUTUBE] Title: {title}")
+                    print(f"[YOUTUBE] URL: {video_url}")
+                    print()
+
+                    return video_url, title
+
+            # ------------------------------------------------
+            # FALLBACK
+            # ------------------------------------------------
+
+            if first_valid_video:
+                video_url, title = first_valid_video
+
+                print()
+                print(
+                    "[YOUTUBE] No Friday/Saturday date found."
+                )
+                print(
+                    "[YOUTUBE] FALLBACK: using latest video."
+                )
+                print(
+                    f"[YOUTUBE] Title: {title}"
+                )
+                print(
+                    f"[YOUTUBE] URL: {video_url}"
+                )
+                print()
+
+                return video_url, title
+
             print(
-                "❌ לא נמצא סרטון מתאים "
-                "ליום שישי או שבת האחרונים."
+                "[YOUTUBE] ERROR: no valid video found."
             )
 
             return None, None
 
-    finally:
+    except Exception as exc:
 
-        _cleanup_cookie(
-            cookie_file,
-            temporary,
+        print()
+        print("[YOUTUBE] SEARCH FAILED")
+        print(
+            f"[YOUTUBE] Exception type: "
+            f"{type(exc).__name__}"
         )
+        print(
+            f"[YOUTUBE] Exception: {exc}"
+        )
+        print()
+
+        return None, None
 
 
 # ============================================================
-# חילוץ Video ID
+# Video ID
 # ============================================================
 
-def extract_video_id(
-    url_or_id: str,
-) -> str:
+def extract_video_id(url_or_id: str) -> str:
+    """
+    חילוץ Video ID מקישור YouTube.
+    """
 
     value = url_or_id.strip()
 
     patterns = [
-
-        # https://www.youtube.com/watch?v=XXXXXXXXXXX
-        # וגם URL עם &list וכו'
-        r"(?:[?&]v=)([A-Za-z0-9_-]{11})",
-
-        # https://youtu.be/XXXXXXXXXXX
+        r"(?:v=)([A-Za-z0-9_-]{11})",
         r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
-
-        # shorts / embed / live
-        r"(?:youtube\.com/"
-        r"(?:shorts|embed|live)/)"
-        r"([A-Za-z0-9_-]{11})",
-
-        # ID ישיר
+        r"(?:youtube\.com/(?:shorts|embed|live)/)([A-Za-z0-9_-]{11})",
         r"^([A-Za-z0-9_-]{11})$",
     ]
 
     for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            value,
-        )
+        match = re.search(pattern, value)
 
         if match:
-
             return match.group(1)
 
     raise ValueError(
-        f"לא ניתן לחלץ Video ID מ: "
-        f"{url_or_id}"
+        f"לא ניתן לזהות Video ID מתוך: {url_or_id}"
     )
 
 
 # ============================================================
-# חילוץ טרנסקריפט
+# Transcript
 # ============================================================
 
-def fetch_transcript(
-    url_or_id: str,
-) -> str:
+def fetch_transcript(url_or_id: str) -> str:
     """
-    חילוץ הטרנסקריפט באמצעות
-    YouTubeTranscriptApi.
+    מקבל transcript ישירות דרך YouTubeTranscriptApi.
 
-    חשוב:
-    כאן אין yt-dlp.
-    אין הורדת וידאו.
+    אין כאן הורדת וידאו.
     """
 
-    video_id = extract_video_id(
-        url_or_id
-    )
+    video_id = extract_video_id(url_or_id)
 
-    print()
-    print("=" * 70)
-    print("📝 חילוץ טרנסקריפט")
-    print("=" * 70)
-
-    print(
-        f"🎬 Video ID: {video_id}"
-    )
-
-    print(
-        f"🌐 שפות מבוקשות: "
-        f"{', '.join(LANGUAGES)}"
-    )
-
-    print(
-        "⬇️ מוריד רק את נתוני הטרנסקריפט "
-        "ולא את הסרטון."
-    )
+    print("=" * 80)
+    print("[TRANSCRIPT] START")
+    print(f"[TRANSCRIPT] Video ID: {video_id}")
+    print(f"[TRANSCRIPT] Languages: {LANGUAGES}")
+    print("=" * 80)
 
     try:
 
-        ytt_api = (
-            YouTubeTranscriptApi()
+        ytt_api = YouTubeTranscriptApi()
+
+        print(
+            "[TRANSCRIPT] Requesting transcript..."
         )
 
         fetched = ytt_api.fetch(
@@ -501,98 +329,137 @@ def fetch_transcript(
         )
 
         if not content.strip():
-
             raise RuntimeError(
-                "הטרנסקריפט נמצא אך הוא ריק."
+                "התקבל transcript ריק."
             )
 
         print(
-            f"✅ הטרנסקריפט חולץ בהצלחה."
-        )
-
-        print(
-            f"📊 אורך הטרנסקריפט: "
-            f"{len(content):,} תווים"
+            f"[TRANSCRIPT] SUCCESS - "
+            f"{len(content):,} characters"
         )
 
         return content
 
-    except (
-        TranscriptsDisabled,
-        NoTranscriptFound,
-    ):
-
+    except TranscriptsDisabled:
         print(
-            "❌ לא נמצאו כתוביות "
-            "זמינות לסרטון."
+            "[TRANSCRIPT] ERROR: "
+            "Transcripts are disabled."
         )
-
         raise
 
-    except Exception as e:
-
+    except NoTranscriptFound:
         print(
-            f"❌ שגיאה בחילוץ הטרנסקריפט: "
-            f"{e}"
+            "[TRANSCRIPT] ERROR: "
+            "No transcript found."
         )
+        raise
 
-        traceback.print_exc()
+    except Exception as exc:
+
+        print()
+        print("[TRANSCRIPT] FAILED")
+        print(
+            f"[TRANSCRIPT] Exception type: "
+            f"{type(exc).__name__}"
+        )
+        print(
+            f"[TRANSCRIPT] Exception: {exc}"
+        )
+        print()
 
         raise
 
 
 # ============================================================
-# תרגום באמצעות Gemini
+# Optional title lookup
+# ============================================================
+
+def get_video_title(video_url: str) -> str:
+    """
+    ניסיון לקבל כותרת לסרטון ישיר.
+
+    הכותרת אינה קריטית להמשך התהליך.
+    אם YouTube מסרב להחזיר אותה, נחזיר כותרת כללית
+    ולא נפיל את כל ה-pipeline.
+    """
+
+    try:
+
+        video_id = extract_video_id(video_url)
+
+        opts = _youtube_opts(
+            {
+                "extract_flat": True,
+                "skip_download": True,
+            }
+        )
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+
+            info = ydl.extract_info(
+                video_url,
+                download=False,
+            )
+
+            title = (
+                (info or {}).get("title")
+                or ""
+            )
+
+            if title.strip():
+                return title.strip()
+
+    except Exception as exc:
+
+        print(
+            "[YOUTUBE] Could not retrieve title "
+            f"for direct URL: {exc}"
+        )
+
+    return "סרטון YouTube"
+
+
+# ============================================================
+# Gemini Translator
 # ============================================================
 
 class GeminiTranslator:
 
-    def __init__(
-        self,
-        api_key: str,
-    ):
+    def __init__(self, api_key: str):
 
         if not api_key:
-
             raise ValueError(
-                "GEMINI_API_KEY חסר "
-                "ב-Environment Variables."
+                "GEMINI_API_KEY חסר ב-Environment Variables."
             )
 
         self.client = genai.Client(
             api_key=api_key
         )
 
-        self.primary_model = os.getenv(
-            "GEMINI_PRIMARY_MODEL",
-            "gemini-2.5-flash",
-        )
+        self.models = [
+            os.getenv(
+                "GEMINI_PRIMARY_MODEL",
+                "gemini-2.5-flash",
+            ),
+            os.getenv(
+                "GEMINI_FALLBACK_MODEL",
+                "gemini-3.1-flash-lite",
+            ),
+        ]
 
-        self.fallback_model = os.getenv(
-            "GEMINI_FALLBACK_MODEL",
-            "gemini-3.1-flash-lite",
-        )
-
-    def translate_large_text(
+    def translate_text(
         self,
         text: str,
     ) -> str:
-        """
-        מתרגם את הטרנסקריפט.
-        """
 
-        if not text.strip():
+        print("=" * 80)
+        print("[GEMINI] START TRANSLATION")
+        print(
+            f"[GEMINI] Input characters: "
+            f"{len(text):,}"
+        )
+        print("=" * 80)
 
-            raise ValueError(
-                "הטרנסקריפט ריק."
-            )
-
-        print()
-        print("=" * 70)
-        print("🌍 תרגום באמצעות Gemini")
-        print("=" * 70)
-
-        # חלוקה כדי לא להיתקע על מגבלת גודל
         chunk_size = int(
             os.getenv(
                 "TRANSLATION_CHUNK_CHARS",
@@ -606,47 +473,34 @@ class GeminiTranslator:
         )
 
         print(
-            f"📊 הטרנסקריפט חולק "
-            f"ל-{len(chunks)} חלקים."
+            f"[GEMINI] Number of chunks: "
+            f"{len(chunks)}"
         )
 
+        translated = []
+
         system_instruction = (
-            "אתה מתרגם מקצועי ומומחה "
-            "לשפה הערבית והעברית. "
+            "אתה מתרגם מקצועי ומומחה לשפה "
+            "הערבית והעברית. "
             "תרגם את התמלול מערבית לעברית. "
             "מדובר בתמלול של דרשה. "
             "התמלול עשוי להכיל שבירות שורה "
             "קצרות שנוצרו מאופי הכתוביות; "
             "התעלם מהן וחבר את המשפטים "
             "לרצף טבעי.\n"
-
             "כללים מחייבים:\n"
-
-            "1. תרגום מלא ומדויק. "
-            "אין לסכם, לקצר, להשמיט "
-            "או להוסיף תוכן.\n"
-
-            "2. שמור על משמעות המקור, "
-            "שמות, מונחים וציטוטים ככל שניתן.\n"
-
-            "3. עברית גבוהה, מכובדת, "
-            "רהוטה וטבעית המתאימה לדרשה.\n"
-
-            "4. החזר פסקאות רציפות "
-            "ולא שורה חדשה אחרי כל משפט.\n"
-
+            "1. תרגום מלא ומדויק. אין לסכם, "
+            "לקצר, להשמיט או להוסיף תוכן.\n"
+            "2. שמור על משמעות המקור, שמות, "
+            "מונחים וציטוטים ככל שניתן.\n"
+            "3. עברית גבוהה, מכובדת, רהוטה "
+            "וטבעית המתאימה לדרשה.\n"
+            "4. החזר פסקאות רציפות ולא שורה "
+            "חדשה אחרי כל משפט.\n"
             "5. אל תוסיף הערות, הקדמות, "
             "הסברים או כותרות משלך.\n"
-
             "6. החזר אך ורק את התרגום."
         )
-
-        translated_chunks = []
-
-        models_to_try = [
-            self.primary_model,
-            self.fallback_model,
-        ]
 
         for index, chunk in enumerate(
             chunks,
@@ -654,8 +508,8 @@ class GeminiTranslator:
         ):
 
             print(
-                f"🤖 מתרגם חלק "
-                f"{index}/{len(chunks)}"
+                f"[GEMINI] Translating "
+                f"chunk {index}/{len(chunks)}..."
             )
 
             prompt = (
@@ -666,19 +520,15 @@ class GeminiTranslator:
             )
 
             result = None
-
             last_error = None
 
-            for model in models_to_try:
+            for model in self.models:
 
                 print(
-                    f"   🔹 מודל: {model}"
+                    f"[GEMINI] Model: {model}"
                 )
 
-                for attempt in range(
-                    1,
-                    4,
-                ):
+                for attempt in range(1, 4):
 
                     try:
 
@@ -686,9 +536,13 @@ class GeminiTranslator:
                             self.client.models.generate_content(
                                 model=model,
                                 contents=[prompt],
-                                config=types.GenerateContentConfig(
-                                    system_instruction=system_instruction,
-                                    temperature=0.2,
+                                config=(
+                                    types.GenerateContentConfig(
+                                        system_instruction=(
+                                            system_instruction
+                                        ),
+                                        temperature=0.2,
+                                    )
                                 ),
                             )
                         )
@@ -703,7 +557,8 @@ class GeminiTranslator:
                             )
 
                             print(
-                                "   ✅ החלק תורגם."
+                                f"[GEMINI] Chunk "
+                                f"{index} completed."
                             )
 
                             break
@@ -716,11 +571,6 @@ class GeminiTranslator:
                             exc,
                             "code",
                             None,
-                        )
-
-                        print(
-                            f"   ⚠️ Gemini API error "
-                            f"{code}: {exc}"
                         )
 
                         if (
@@ -744,15 +594,14 @@ class GeminiTranslator:
                             wait_time = min(
                                 60,
                                 5 * (
-                                    2 ** (
-                                        attempt - 1
-                                    )
+                                    2 ** (attempt - 1)
                                 ),
                             )
 
                             print(
-                                f"   ⏳ ממתין "
-                                f"{wait_time} שניות..."
+                                f"[GEMINI] Temporary "
+                                f"error {code}. "
+                                f"Waiting {wait_time}s..."
                             )
 
                             time.sleep(
@@ -768,52 +617,46 @@ class GeminiTranslator:
                         last_error = exc
 
                         print(
-                            f"   ❌ שגיאה: "
+                            "[GEMINI] Unexpected error: "
                             f"{exc}"
                         )
 
                         break
 
                 if result:
-
                     break
 
             if not result:
 
                 raise RuntimeError(
                     f"Gemini נכשל בתרגום "
-                    f"חלק {index}/"
-                    f"{len(chunks)}: "
+                    f"חלק {index}/{len(chunks)}: "
                     f"{last_error}"
                 )
 
-            translated_chunks.append(
-                result
-            )
+            translated.append(result)
 
-        translation = "\n\n".join(
-            translated_chunks
+        final_text = "\n\n".join(
+            translated
         )
 
         print(
-            f"✅ התרגום הסתיים. "
-            f"{len(translation):,} תווים."
+            f"[GEMINI] Translation complete. "
+            f"Output characters: "
+            f"{len(final_text):,}"
         )
 
-        return translation
+        return final_text
 
 
 # ============================================================
-# פיצול טקסט
+# Text splitting
 # ============================================================
 
 def split_text(
     text: str,
     max_chars: int,
 ):
-    """
-    מפצל טקסט לפי פסקאות ככל האפשר.
-    """
 
     paragraphs = [
         p.strip()
@@ -825,7 +668,6 @@ def split_text(
     ]
 
     chunks = []
-
     current = ""
 
     for paragraph in paragraphs:
@@ -833,11 +675,9 @@ def split_text(
         if len(paragraph) > max_chars:
 
             if current:
-
                 chunks.append(
                     current.strip()
                 )
-
                 current = ""
 
             for i in range(
@@ -862,8 +702,7 @@ def split_text(
 
         if len(candidate) > max_chars:
 
-            if current:
-
+            if current.strip():
                 chunks.append(
                     current.strip()
                 )
@@ -871,11 +710,9 @@ def split_text(
             current = paragraph
 
         else:
-
             current = candidate
 
     if current.strip():
-
         chunks.append(
             current.strip()
         )
@@ -884,7 +721,7 @@ def split_text(
 
 
 # ============================================================
-# שליחה לטלגרם
+# Telegram
 # ============================================================
 
 async def send_to_telegram(
@@ -921,27 +758,19 @@ async def send_to_telegram(
         return (
             False,
             "משתני טלגרם חסרים; "
-            "התרגום הושלם אך "
-            "לא נשלח לטלגרם.",
+            "התרגום הושלם אך לא נשלח לטלגרם.",
         )
 
-    api_id = int(
-        api_id_env
-    )
+    api_id = int(api_id_env)
 
     chunks = split_text(
         full_text,
         MAX_TELEGRAM_CHARS,
     )
 
-    print()
-    print("=" * 70)
-    print("📨 שליחה לטלגרם")
-    print("=" * 70)
-
     print(
-        f"📊 מספר הודעות: "
-        f"{len(chunks)}"
+        f"[TELEGRAM] Sending "
+        f"{len(chunks)} chunks..."
     )
 
     async with TelegramClient(
@@ -965,8 +794,8 @@ async def send_to_telegram(
         ):
 
             print(
-                f"📤 שולח הודעה "
-                f"{index}/{len(chunks)}..."
+                f"[TELEGRAM] Sending "
+                f"{index}/{len(chunks)}"
             )
 
             await client.send_message(
@@ -981,16 +810,12 @@ async def send_to_telegram(
         await client.send_message(
             target_user,
             (
-                "🔗 **קישור לסרטון המקורי "
-                "ביוטיוב:**\n"
+                "🔗 **קישור לסרטון "
+                "המקורי ביוטיוב:**\n"
                 f"{video_url}\n\n"
                 "✨ המשימה הושלמה בהצלחה!"
             ),
         )
-
-    print(
-        "✅ התרגום נשלח לטלגרם בהצלחה."
-    )
 
     return (
         True,
@@ -999,60 +824,33 @@ async def send_to_telegram(
 
 
 # ============================================================
-# Pipeline
+# MAIN PIPELINE
 # ============================================================
 
 def run_pipeline(
     video_url: Optional[str] = None,
     speaker: Optional[str] = None,
 ):
-    """
-    Pipeline ראשי.
-
-    אפשרות 1:
-        speaker="salah"
-
-    אפשרות 2:
-        speaker="khateb"
-
-    אפשרות 3:
-        video_url="https://www.youtube.com/watch?v=..."
-
-    במקרה של URL ישיר:
-    yt-dlp אינו מופעל בכלל.
-    """
 
     print()
     print("=" * 80)
-    print("🚀 PIPELINE START")
+    print("[PIPELINE] START")
+    print(f"[PIPELINE] video_url={video_url}")
+    print(f"[PIPELINE] speaker={speaker}")
     print("=" * 80)
-
-    print(
-        f"[PIPELINE] video_url={video_url}"
-    )
-
-    print(
-        f"[PIPELINE] speaker={speaker}"
-    )
 
     try:
 
         # ====================================================
-        # שלב 1 — קביעת הסרטון
+        # 1. Direct URL
         # ====================================================
 
-        if (
-            video_url
-            and video_url.strip()
-        ):
+        if video_url and video_url.strip():
 
-            video_url = (
-                video_url.strip()
-            )
+            video_url = video_url.strip()
 
-            print()
             print(
-                "🔗 התקבל URL ישיר."
+                "[PIPELINE] Direct YouTube URL supplied"
             )
 
             video_id = extract_video_id(
@@ -1060,30 +858,38 @@ def run_pipeline(
             )
 
             print(
-                f"🎬 Video ID: {video_id}"
+                f"[PIPELINE] Video ID: {video_id}"
             )
 
-            # בכוונה לא קוראים כאן ל-yt-dlp.
-            #
-            # זה חשוב:
-            # אם YouTube/yt-dlp מחזיר
-            # Requested format is not available,
-            # זה לא אמור לעצור URL ישיר.
-            #
-            video_title = (
-                f"YouTube video {video_id}"
+            # ------------------------------------------------
+            # חשוב:
+            # לא מפילים את התהליך בגלל title.
+            # קודם transcript.
+            # ------------------------------------------------
+
+            title = get_video_title(
+                video_url
             )
+
+            print(
+                f"[PIPELINE] Title: {title}"
+            )
+
+        # ====================================================
+        # 2. Speaker / automatic discovery
+        # ====================================================
 
         elif speaker in SPEAKER_URLS:
 
-            print()
             print(
-                f"🎤 נבחר דרשן: {speaker}"
+                f"[PIPELINE] Speaker selected: "
+                f"{speaker}"
             )
 
-            video_url, video_title = (
+            video_url, title = (
                 find_latest_friday_video(
-                    SPEAKER_URLS[speaker]
+                    SPEAKER_URLS[speaker],
+                    max_videos=MAX_VIDEOS_TO_SCAN,
                 )
             )
 
@@ -1092,14 +898,10 @@ def run_pipeline(
                 return {
                     "success": False,
                     "message": (
-                        "לא נמצאה דרשה מתאימה "
+                        f"לא נמצאה דרשה מתאימה "
                         f"עבור {speaker}."
                     ),
                 }
-
-            video_id = extract_video_id(
-                video_url
-            )
 
         else:
 
@@ -1111,36 +913,38 @@ def run_pipeline(
                 ),
             }
 
-        print()
-        print(
-            f"🎬 סרטון: {video_url}"
-        )
-
-        print(
-            f"📌 כותרת: {video_title}"
-        )
-
         # ====================================================
-        # שלב 2 — טרנסקריפט
+        # 3. Transcript
         # ====================================================
 
         print()
         print(
-            "📝 מתחיל חילוץ טרנסקריפט..."
+            "[PIPELINE] Fetching transcript..."
         )
 
         transcript = fetch_transcript(
             video_url
         )
 
+        if not transcript.strip():
+
+            raise RuntimeError(
+                "התקבל transcript ריק."
+            )
+
         print(
-            f"✅ טרנסקריפט התקבל: "
-            f"{len(transcript):,} תווים"
+            f"[PIPELINE] Transcript received: "
+            f"{len(transcript):,} chars"
         )
 
         # ====================================================
-        # שלב 3 — Gemini
+        # 4. Gemini
         # ====================================================
+
+        print()
+        print(
+            "[PIPELINE] Starting Gemini translation..."
+        )
 
         translator = GeminiTranslator(
             os.getenv(
@@ -1150,17 +954,16 @@ def run_pipeline(
         )
 
         translation = (
-            translator.translate_large_text(
+            translator.translate_text(
                 transcript
             )
         )
 
         # ====================================================
-        # שלב 4 — Telegram
+        # 5. Telegram
         # ====================================================
 
         telegram_ok = False
-
         telegram_message = ""
 
         try:
@@ -1169,7 +972,7 @@ def run_pipeline(
                 asyncio.run(
                     send_to_telegram(
                         translation,
-                        video_title,
+                        title,
                         video_url,
                     )
                 )
@@ -1177,75 +980,74 @@ def run_pipeline(
 
         except Exception as exc:
 
-            print(
-                f"⚠️ שגיאה בטלגרם: "
-                f"{exc}"
-            )
-
-            traceback.print_exc()
-
             telegram_message = (
                 f"שגיאה בטלגרם: {exc}"
             )
 
+            print(
+                f"[PIPELINE] Telegram error: "
+                f"{exc}"
+            )
+
         # ====================================================
-        # הצלחה
+        # SUCCESS
         # ====================================================
 
         print()
         print("=" * 80)
-        print("🎉 PIPELINE SUCCESS")
+        print("[PIPELINE] SUCCESS")
         print("=" * 80)
 
         return {
             "success": True,
-
             "message": (
                 f"התרגום הושלם. "
                 f"{telegram_message}"
             ),
-
             "video_url": video_url,
-
-            "video_title": video_title,
-
+            "video_title": title,
             "translation": translation,
-
             "telegram_sent": telegram_ok,
+        }
+
+    except (
+        TranscriptsDisabled,
+        NoTranscriptFound,
+    ) as exc:
+
+        print()
+        print(
+            "[PIPELINE] TRANSCRIPT ERROR"
+        )
+        print(
+            f"[PIPELINE] {type(exc).__name__}: "
+            f"{exc}"
+        )
+
+        return {
+            "success": False,
+            "message": (
+                "לא נמצאו כתוביות/Transcript "
+                "עבור הסרטון."
+            ),
         }
 
     except Exception as exc:
 
         print()
         print("=" * 80)
-        print("❌ PIPELINE FAILED")
+        print("[PIPELINE] !!! FAILED !!!")
         print("=" * 80)
-
         print(
-            f"Exception type: "
+            f"[PIPELINE] Exception type: "
             f"{type(exc).__name__}"
         )
-
         print(
-            f"Exception: {exc}"
+            f"[PIPELINE] Exception: {exc}"
         )
-
-        print()
-        print(
-            "Full traceback:"
-        )
-
-        traceback.print_exc()
-
         print("=" * 80)
 
         return {
             "success": False,
             "message": str(exc),
         }
-
-
-# ============================================================
-# נקודת כניסה
-# ============================================================
-
