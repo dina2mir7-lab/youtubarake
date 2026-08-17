@@ -128,57 +128,33 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(url_or_id: str) -> str:
-    """חילוץ כתוביות חסין שגיאות ותואם לכל הגרסאות של youtube-transcript-api"""
+    """חילוץ כתוביות ישיר, ממוקד ונקי באמצעות YouTubeTranscriptApi.get_transcript"""
     video_id = extract_video_id(url_or_id)
     cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
     cookie_file_path = None
 
+    # יצירת קובץ עוגיות זמני במידה ומוגדר ב-Render
     if cookies_text:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
             cookie_file.write(cookies_text)
             cookie_file_path = cookie_file.name
 
     try:
-        kwargs = {'cookies': cookie_file_path} if cookie_file_path else {}
+        # הקריאה הרישמית והיציבה של הספרייה
+        if cookie_file_path:
+            transcript_list = YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=["ar", "he", "en"], 
+                cookies=cookie_file_path
+            )
+        else:
+            transcript_list = YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=["ar", "he", "en"]
+            )
 
-        # 1. ניסיון ראשי: list_transcripts (תומך עוגיות באופן מלא בכל הגרסאות החדשות)
-        if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
-            try:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id, **kwargs)
-                try:
-                    transcript = transcript_list.find_transcript(['ar', 'he', 'en'])
-                except Exception:
-                    transcript = next(iter(transcript_list))
-                
-                fetched = transcript.fetch()
-                
-                if hasattr(fetched, 'snippets'):
-                    return "\n".join(s.text for s in fetched.snippets)
-                
-                lines = []
-                for item in fetched:
-                    if isinstance(item, dict):
-                        lines.append(item.get('text', ''))
-                    elif hasattr(item, 'text'):
-                        lines.append(item.text)
-                    else:
-                        lines.append(str(item))
-                return "\n".join(lines)
-            except Exception as e:
-                print(f"⚠️ list_transcripts נכשל, עובר לניסיון משני: {e}")
-
-        # 2. ניסיון משני: fetch דרך Instance של האובייקט
-        try:
-            ytt = YouTubeTranscriptApi()
-            if hasattr(ytt, 'fetch'):
-                fetched = ytt.fetch(video_id, languages=["ar", "he", "en"], **kwargs)
-                if hasattr(fetched, 'snippets'):
-                    return "\n".join(s.text for s in fetched.snippets)
-                return "\n".join(item.get("text", "") if isinstance(item, dict) else getattr(item, "text", str(item)) for item in fetched)
-        except Exception as e:
-            print(f"⚠️ ytt.fetch נכשל: {e}")
-
-        raise RuntimeError("לא ניתן היה לחלץ כתוביות בגרסת הספרייה הנוכחית.")
+        # הרכבת הטקסט מתוך רשימת המילונים
+        return "\n".join(item["text"] for item in transcript_list)
 
     finally:
         if cookie_file_path and os.path.exists(cookie_file_path):
