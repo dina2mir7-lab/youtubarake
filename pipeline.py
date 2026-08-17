@@ -382,86 +382,284 @@ def _download_subtitle_text(
 
 def fetch_transcript(video_url: str) -> str:
     """
-    Fetch the YouTube transcript WITHOUT downloading the video.
-
-    Priority:
-    Arabic -> Hebrew -> English
-
-    For each language:
-    manual subtitles -> automatic captions
+    Fetch YouTube transcript WITHOUT downloading the video.
+    Includes detailed diagnostics for yt-dlp failures.
     """
 
     video_id = extract_video_id(video_url)
+
+    print("=" * 80)
+    print("[TRANSCRIPT] Starting transcript extraction")
+    print(f"[TRANSCRIPT] Video URL: {video_url}")
+    print(f"[TRANSCRIPT] Video ID: {video_id}")
+    print("[TRANSCRIPT] IMPORTANT: video download is disabled")
+    print("=" * 80)
 
     opts, cookie_file, temporary = _youtube_opts(
         {
             "skip_download": True,
             "noplaylist": True,
+            "writesubtitles": False,
+            "writeautomaticsub": False,
         }
+    )
+
+    print("[TRANSCRIPT] yt-dlp options:")
+    print(
+        {
+            key: value
+            for key, value in opts.items()
+            if key != "cookiefile"
+        }
+    )
+    print(
+        f"[TRANSCRIPT] Cookies enabled: "
+        f"{bool(cookie_file)}"
     )
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
 
-            # Metadata only.
-            # download=False is critical.
-            info = ydl.extract_info(
-                video_url,
-                download=False,
+            print(
+                "[TRANSCRIPT] Calling "
+                "extract_info(download=False)..."
             )
+
+            try:
+                info = ydl.extract_info(
+                    video_url,
+                    download=False,
+                )
+
+                print(
+                    "[TRANSCRIPT] extract_info() completed successfully"
+                )
+
+            except Exception as exc:
+                print("=" * 80)
+                print("[TRANSCRIPT] !!! extract_info() FAILED !!!")
+                print(f"[TRANSCRIPT] Exception type: {type(exc).__name__}")
+                print(f"[TRANSCRIPT] Exception: {exc}")
+                print("[TRANSCRIPT] Full traceback:")
+                traceback.print_exc()
+                print("=" * 80)
+
+                raise
 
             if not info:
                 raise RuntimeError(
                     "YouTube לא החזיר מידע על הסרטון."
                 )
 
+            print("[TRANSCRIPT] Metadata received")
+            print(
+                f"[TRANSCRIPT] Title: "
+                f"{info.get('title')}"
+            )
+            print(
+                f"[TRANSCRIPT] Upload date: "
+                f"{info.get('upload_date')}"
+            )
+            print(
+                f"[TRANSCRIPT] Duration: "
+                f"{info.get('duration')}"
+            )
+
+            # --------------------------------------------------
+            # Inspect subtitles
+            # --------------------------------------------------
+
+            subtitles = info.get("subtitles") or {}
+            automatic_captions = (
+                info.get("automatic_captions") or {}
+            )
+
+            print(
+                "[TRANSCRIPT] Manual subtitle languages:"
+            )
+            print(
+                list(subtitles.keys())
+            )
+
+            print(
+                "[TRANSCRIPT] Automatic caption languages:"
+            )
+            print(
+                list(automatic_captions.keys())
+            )
+
+            print(
+                "[TRANSCRIPT] Requested language priority:"
+            )
+            print(LANGUAGES)
+
             subtitle_track = None
             selected_language = None
+            selected_source = None
+
+            # --------------------------------------------------
+            # Search manual subtitles first
+            # --------------------------------------------------
 
             for language in LANGUAGES:
+
+                print(
+                    f"[TRANSCRIPT] Checking manual subtitles "
+                    f"for language: {language}"
+                )
+
                 tracks = _select_subtitle_track(
-                    info,
+                    {
+                        "subtitles": subtitles,
+                        "automatic_captions": {},
+                    },
                     language,
                 )
 
-                selected_track = _select_vtt_format(tracks)
+                if tracks:
+                    print(
+                        f"[TRANSCRIPT] Found manual track "
+                        f"for {language}"
+                    )
 
-                if selected_track:
-                    subtitle_track = selected_track
-                    selected_language = language
-                    break
+                    subtitle_track = _select_vtt_format(
+                        tracks
+                    )
+
+                    if subtitle_track:
+                        selected_language = language
+                        selected_source = "manual"
+                        break
+
+            # --------------------------------------------------
+            # If no manual subtitles, search automatic captions
+            # --------------------------------------------------
 
             if not subtitle_track:
-                available_manual = list(
-                    (info.get("subtitles") or {}).keys()
-                )
 
-                available_auto = list(
-                    (info.get("automatic_captions") or {}).keys()
+                for language in LANGUAGES:
+
+                    print(
+                        f"[TRANSCRIPT] Checking automatic captions "
+                        f"for language: {language}"
+                    )
+
+                    tracks = _select_subtitle_track(
+                        {
+                            "subtitles": {},
+                            "automatic_captions": automatic_captions,
+                        },
+                        language,
+                    )
+
+                    if tracks:
+                        print(
+                            f"[TRANSCRIPT] Found automatic track "
+                            f"for {language}"
+                        )
+
+                        subtitle_track = _select_vtt_format(
+                            tracks
+                        )
+
+                        if subtitle_track:
+                            selected_language = language
+                            selected_source = "automatic"
+                            break
+
+            # --------------------------------------------------
+            # No transcript
+            # --------------------------------------------------
+
+            if not subtitle_track:
+
+                print("=" * 80)
+                print(
+                    "[TRANSCRIPT] !!! NO SUITABLE TRANSCRIPT FOUND !!!"
                 )
+                print(
+                    f"[TRANSCRIPT] Manual languages: "
+                    f"{list(subtitles.keys())}"
+                )
+                print(
+                    f"[TRANSCRIPT] Automatic languages: "
+                    f"{list(automatic_captions.keys())}"
+                )
+                print("=" * 80)
 
                 raise RuntimeError(
-                    "לא נמצאו כתוביות/טרנסקריפט לסרטון. "
-                    f"שפות כתוביות זמינות: {available_manual or 'אין'}; "
-                    f"שפות כתוביות אוטומטיות זמינות: "
-                    f"{available_auto or 'אין'}. "
-                    "אם הסרטון מוגן, ודא שקובץ cookies.txt תקין ומעודכן."
+                    "לא נמצאו כתוביות/טרנסקריפט "
+                    "בשפות המבוקשות."
                 )
+
+            print("=" * 80)
+            print("[TRANSCRIPT] SELECTED SUBTITLE")
+            print(
+                f"[TRANSCRIPT] Language: "
+                f"{selected_language}"
+            )
+            print(
+                f"[TRANSCRIPT] Source: "
+                f"{selected_source}"
+            )
+            print(
+                f"[TRANSCRIPT] Extension: "
+                f"{subtitle_track.get('ext')}"
+            )
+            print(
+                f"[TRANSCRIPT] Name: "
+                f"{subtitle_track.get('name')}"
+            )
+            print(
+                f"[TRANSCRIPT] URL exists: "
+                f"{bool(subtitle_track.get('url'))}"
+            )
+            print("=" * 80)
 
             subtitle_url = subtitle_track.get("url")
 
             if not subtitle_url:
                 raise RuntimeError(
-                    f"נמצא track ל-{selected_language}, "
-                    "אך אין לו URL להורדה."
+                    "נמצא track לכתוביות אך אין לו URL."
                 )
 
-            # IMPORTANT:
-            # This downloads ONLY the subtitle resource.
-            # No video format is selected or downloaded.
-            subtitle_text = _download_subtitle_text(
-                subtitle_url,
-                ydl,
+            print(
+                "[TRANSCRIPT] Downloading SUBTITLE RESOURCE ONLY"
+            )
+            print(
+                "[TRANSCRIPT] No video download is being performed"
+            )
+
+            try:
+                subtitle_text = _download_subtitle_text(
+                    subtitle_url,
+                    ydl,
+                )
+
+            except Exception as exc:
+
+                print("=" * 80)
+                print(
+                    "[TRANSCRIPT] !!! SUBTITLE DOWNLOAD FAILED !!!"
+                )
+                print(
+                    f"[TRANSCRIPT] Exception type: "
+                    f"{type(exc).__name__}"
+                )
+                print(
+                    f"[TRANSCRIPT] Exception: {exc}"
+                )
+                print(
+                    "[TRANSCRIPT] Full traceback:"
+                )
+                traceback.print_exc()
+                print("=" * 80)
+
+                raise
+
+            print(
+                f"[TRANSCRIPT] Subtitle response size: "
+                f"{len(subtitle_text)} characters"
             )
 
             if not subtitle_text.strip():
@@ -469,18 +667,34 @@ def fetch_transcript(video_url: str) -> str:
                     "קובץ הכתוביות התקבל אך הוא ריק."
                 )
 
-            transcript = _clean_vtt(subtitle_text)
+            transcript = _clean_vtt(
+                subtitle_text
+            )
+
+            print(
+                f"[TRANSCRIPT] Clean transcript size: "
+                f"{len(transcript)} characters"
+            )
 
             if not transcript.strip():
                 raise RuntimeError(
-                    "הכתוביות התקבלו אך לא ניתן היה לחלץ מהן טקסט."
+                    "הכתוביות התקבלו אך לא ניתן "
+                    "היה לחלץ מהן טקסט."
                 )
+
+            print("=" * 80)
+            print(
+                "[TRANSCRIPT] SUCCESS - transcript extracted"
+            )
+            print("=" * 80)
 
             return transcript
 
     finally:
-        _cleanup_cookie(cookie_file, temporary)
-
+        _cleanup_cookie(
+            cookie_file,
+            temporary,
+        )
 
 def get_video_title(video_url: str) -> str:
     """
