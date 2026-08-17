@@ -1,13 +1,10 @@
 import os
 import re
-import glob
 import time
 import asyncio
 import datetime
 import tempfile
-import requests
-import yt_dlp
-from youtube_transcript_api import TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -44,17 +41,14 @@ async def send_to_telegram(full_text: str, video_title: str, video_url: str):
     text_chunks = split_text(full_text, MAX_TELEGRAM_CHARS)
 
     async with TelegramClient(StringSession(session_str), api_id, api_hash) as client:
-        # הודעת כותרת
         header_msg = f"🎬 **תרגום אוטומטי לדרשה**\n📌 **כותרת:** {video_title}\n\nהתוכן מתחיל מטה 👇"
         await client.send_message(target_user, header_msg)
         await asyncio.sleep(1.0)
 
-        # שליחת חלקי הטקסט
         for index, chunk in enumerate(text_chunks, 1):
             await client.send_message(target_user, chunk)
             await asyncio.sleep(1.2)
 
-        # הודעת סגירה
         footer_msg = f"🔗 **קישור לסרטון המקורי ביוטיוב:**\n{video_url}\n\n✨ המשימה הושלמה בהצלחה!"
         await client.send_message(target_user, footer_msg)
 
@@ -62,67 +56,6 @@ async def send_to_telegram(full_text: str, video_title: str, video_url: str):
 # ==========================================
 # איתור סרטונים וחילוץ
 # ==========================================
-def get_target_dates_strings():
-    today = datetime.date.today()
-    days_to_subtract = (today.weekday() - 4) % 7
-    last_friday = today - datetime.timedelta(days=days_to_subtract)
-    last_saturday = last_friday + datetime.timedelta(days=1)
-
-    separators = ['.', '/', '-']
-    date_formats = set()
-
-    def add_date_combinations(target_date):
-        days = [str(target_date.day), target_date.strftime('%d')]
-        months = [str(target_date.month), target_date.strftime('%m')]
-        years = [str(target_date.year), str(target_date.year)[2:]]
-        for d in days:
-            for m in months:
-                for y in years:
-                    for sep in separators:
-                        date_formats.add(f"{d}{sep}{m}{sep}{y}")
-
-    add_date_combinations(last_friday)
-    add_date_combinations(last_saturday)
-    return list(date_formats)
-
-
-def find_latest_friday_video(url, max_videos=15):
-    target_dates = get_target_dates_strings()
-    ydl_opts = {
-        'extract_flat': True,
-        'skip_download': True,
-        'playlistend': max_videos,
-        'ignoreerrors': True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            result_dict = ydl.extract_info(url, download=False)
-            if not result_dict:
-                return None, None
-
-            videos = result_dict.get('entries', [])
-            if not videos and 'title' in result_dict:
-                videos = [result_dict]
-
-            for video in videos:
-                if not video:
-                    continue
-                title = video.get('title') or ''
-                v_id = video.get('id') or video.get('video_id')
-                if not v_id:
-                    continue
-
-                video_url = f"https://www.youtube.com/watch?v={v_id}"
-                if any(target_date in title for target_date in target_dates):
-                    return video_url, title
-
-            return None, None
-        except Exception as e:
-            print(f"⚠️ שגיאה בסריקת יוטיוב: {e}")
-            return None, None
-
-
 def extract_video_id(url_or_id: str) -> str:
     patterns = [r"(?:v=)([a-zA-Z0-9_-]{11})", r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})", r"^([a-zA-Z0-9_-]{11})$"]
     for pattern in patterns:
@@ -133,67 +66,32 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(url_or_id: str) -> str:
-    """מוריד את הכתוביות ישירות לקובץ זמני בדיסק בעזרת yt-dlp ומחלץ את הטקסט"""
+    """חילוץ כתוביות יציב, פשוט ומקצועי באמצעות עוגיות"""
     video_id = extract_video_id(url_or_id)
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
     cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
     cookie_file_path = None
 
+    # אם הוגדרו עוגיות ב-Render, יוצרים קובץ זמני בפורמט Netscape
     if cookies_text:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
             cookie_file.write(cookies_text)
             cookie_file_path = cookie_file.name
 
-    with tempfile.TemporaryDirectory() as out_dir:
-        output_template = os.path.join(out_dir, '%(id)s')
-
-        ydl_opts = {
-            'skip_download': True,
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitleslangs': ['ar', 'he', 'en'],
-            'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-            'geo_bypass': True,
-        }
-
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        
+        # שליפה עם או בלי עוגיות
         if cookie_file_path:
-            ydl_opts['cookiefile'] = cookie_file_path
+            fetched = ytt_api.fetch(video_id, languages=["ar", "he", "en"], cookies=cookie_file_path)
+        else:
+            fetched = ytt_api.fetch(video_id, languages=["ar", "he", "en"])
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video_url])
+        return "\n".join(snippet.text for snippet in fetched.snippets)
 
-            # חיפוש קובץ הכתוביות שירד לתיקייה (בפורמט vtt, json3 או ttml)
-            sub_files = glob.glob(os.path.join(out_dir, "*"))
-            if not sub_files:
-                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
-
-            # קריאת הקובץ שירד
-            sub_file = sub_files[0]
-            with open(sub_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-
-            transcript_lines = []
-            # ניקוי שורות במידה וזה קובץ VTT/SRT
-            for line in content.splitlines():
-                line = line.strip()
-                if line and not line.startswith("WEBVTT") and not line.startswith("Kind:") and not line.startswith("Language:") and "-->" not in line and not line.isdigit():
-                    if not transcript_lines or transcript_lines[-1] != line:
-                        transcript_lines.append(line)
-
-            if not transcript_lines:
-                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
-
-            return "\n".join(transcript_lines)
-
-        finally:
-            if cookie_file_path and os.path.exists(cookie_file_path):
-                os.remove(cookie_file_path)
+    finally:
+        # ניקוי הקובץ הזמני
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
 
 
 def split_text(text, max_chars):
@@ -279,25 +177,15 @@ class GeminiTranslator:
 
 
 # ==========================================
-# הצינור הראשי שיופעל מרחוק
+# הצינור הראשי
 # ==========================================
 def run_pipeline(video_url: str = None, speaker: str = None):
     gemini_key = os.getenv("GEMINI_API_KEY")
     video_title = "סרטון יוטיוב"
 
-    # איתור קישור לפי דרשן במידת הצורך
-    if not video_url and speaker in SPEAKER_URLS:
-        target_channel_url = SPEAKER_URLS[speaker]
-        found_url, found_title = find_latest_friday_video(target_channel_url, max_videos=MAX_VIDEOS_TO_SCAN)
-        if not found_url:
-            return {"success": False, "message": f"לא נמצאה דרשה מתאימה ליום שישי האחרון עבור {speaker}."}
-        video_url = found_url
-        video_title = found_title
-
     if not video_url:
         return {"success": False, "message": "לא סופק קישור תקין ליוטיוב."}
 
-    # שימוש בתיקייה זמנית של מערכת ההפעלה
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             video_id = extract_video_id(video_url)
@@ -307,7 +195,7 @@ def run_pipeline(video_url: str = None, speaker: str = None):
         original_file = os.path.join(temp_dir, f"transcript_{video_id}_orig.txt")
         translated_file = os.path.join(temp_dir, f"transcript_{video_id}_trans.txt")
 
-        # 1. חילוץ טרנסקריפט
+        # 1. חילוץ טרנסקריפט ישיר בעזרת עוגיות
         try:
             transcript_text = fetch_transcript(video_url)
             with open(original_file, "w", encoding="utf-8") as f:
@@ -325,7 +213,7 @@ def run_pipeline(video_url: str = None, speaker: str = None):
         with open(translated_file, "r", encoding="utf-8") as f:
             full_translated_text = f.read()
 
-        # 3. שליחה לטלגרם דרך Telethon (הרצה בטוחה בתוך Loop קיים)
+        # 3. שליחה לטלגרם
         try:
             try:
                 loop = asyncio.get_event_loop()
