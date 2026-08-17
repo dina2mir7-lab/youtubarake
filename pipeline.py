@@ -135,8 +135,16 @@ def fetch_transcript(url_or_id: str) -> str:
     video_id = extract_video_id(url_or_id)
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # הגדרות yt-dlp להורדת כתוביות בלבד ללא הסרטון עצמו
-ydl_opts = {
+    cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
+    cookie_file_path = None
+
+    # יצירת קובץ cookies זמני מתוך משתנה הסביבה במידה וקיים
+    if cookies_text:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
+            cookie_file.write(cookies_text)
+            cookie_file_path = cookie_file.name
+
+    ydl_opts = {
         'skip_download': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -145,58 +153,59 @@ ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        # תוספת מומלצת למניעת חסימות בשרתי ענן:
         'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
         'geo_bypass': True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        subtitles = info.get('subtitles') or info.get('automatic_captions')
+    if cookie_file_path:
+        ydl_opts['cookiefile'] = cookie_file_path
 
-        if not subtitles:
-            raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            subtitles = info.get('subtitles') or info.get('automatic_captions')
 
-        # בחירת השפה הראשונה הזמינה מתוך הרשימה
-        target_lang = None
-        for lang in ['ar', 'he', 'en']:
-            if lang in subtitles:
-                target_lang = lang
-                break
+            if not subtitles:
+                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
-        if not target_lang:
-            # אם לא מצאנו מהרשימה, ניקח את השפה הראשונה שישנה
-            target_lang = list(subtitles.keys())[0]
+            target_lang = None
+            for lang in ['ar', 'he', 'en']:
+                if lang in subtitles:
+                    target_lang = lang
+                    break
 
-        # שליפת קישור הכתוביות בפורמט json3 או vtt
-        sub_info = subtitles[target_lang]
-        sub_url = None
-        for fmt in sub_info:
-            if fmt.get('ext') == 'json3':
-                sub_url = fmt.get('url')
-                break
-        if not sub_url and sub_info:
-            sub_url = sub_info[0].get('url')
+            if not target_lang:
+                target_lang = list(subtitles.keys())[0]
 
-        if not sub_url:
-            raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
+            sub_info = subtitles[target_lang]
+            sub_url = None
+            for fmt in sub_info:
+                if fmt.get('ext') == 'json3':
+                    sub_url = fmt.get('url')
+                    break
+            if not sub_url and sub_info:
+                sub_url = sub_info[0].get('url')
 
-        # הורדת תוכן הכתוביות מיוטיוב
-        resp = requests.get(sub_url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        data = resp.json()
+            if not sub_url:
+                raise NoTranscriptFound(video_id, ['ar', 'he', 'en'], None)
 
-        # חילוץ הטקסט מתוך מבנה ה-JSON של יוטיוב
-        transcript_lines = []
-        for event in data.get('events', []):
-            segs = event.get('segs')
-            if segs:
-                line_text = "".join(s.get('utf8', '') for s in segs if 'utf8' in s).strip()
-                if line_text and line_text != '\n':
-                    transcript_lines.append(line_text)
+            headers = {'User-Agent': ydl_opts['user_agent']}
+            resp = requests.get(sub_url, headers=headers)
+            data = resp.json()
 
-        return "\n".join(transcript_lines)
+            transcript_lines = []
+            for event in data.get('events', []):
+                segs = event.get('segs')
+                if segs:
+                    line_text = "".join(s.get('utf8', '') for s in segs if 'utf8' in s).strip()
+                    if line_text and line_text != '\n':
+                        transcript_lines.append(line_text)
+
+            return "\n".join(transcript_lines)
+    finally:
+        # מחיקת הקובץ הזמני בסיום
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
 
 
 def split_text(text, max_chars):
