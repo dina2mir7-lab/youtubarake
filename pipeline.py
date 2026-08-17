@@ -1026,17 +1026,14 @@ def run_pipeline(
     speaker: Optional[str] = None,
 ):
     """
-    Main pipeline.
-
-    Direct URL:
-        URL -> metadata -> transcript -> translation
-
-    Speaker:
-        latest video -> metadata -> transcript -> translation
-
-    IMPORTANT:
-    At no point is the YouTube video itself downloaded.
+    Main pipeline with diagnostic logging.
     """
+
+    print("=" * 80)
+    print("[PIPELINE] START")
+    print(f"[PIPELINE] video_url={video_url}")
+    print(f"[PIPELINE] speaker={speaker}")
+    print("=" * 80)
 
     try:
 
@@ -1044,15 +1041,37 @@ def run_pipeline(
 
             video_url = video_url.strip()
 
+            print(
+                "[PIPELINE] Direct YouTube URL supplied"
+            )
+
             extract_video_id(
                 video_url
+            )
+
+            print(
+                f"[PIPELINE] Video ID: "
+                f"{extract_video_id(video_url)}"
+            )
+
+            print(
+                "[PIPELINE] Getting video title..."
             )
 
             title = get_video_title(
                 video_url
             )
 
+            print(
+                f"[PIPELINE] Title: {title}"
+            )
+
         elif speaker in SPEAKER_URLS:
+
+            print(
+                f"[PIPELINE] Finding latest video "
+                f"for speaker: {speaker}"
+            )
 
             video_url, title = (
                 find_latest_friday_video(
@@ -1060,7 +1079,18 @@ def run_pipeline(
                 )
             )
 
+            print(
+                f"[PIPELINE] Selected URL: "
+                f"{video_url}"
+            )
+
+            print(
+                f"[PIPELINE] Selected title: "
+                f"{title}"
+            )
+
             if not video_url:
+
                 return {
                     "success": False,
                     "message": (
@@ -1079,10 +1109,21 @@ def run_pipeline(
                 ),
             }
 
-        # Transcript only.
-        # No video download.
+        print(
+            "[PIPELINE] Starting transcript extraction..."
+        )
+
         transcript = fetch_transcript(
             video_url
+        )
+
+        print(
+            f"[PIPELINE] Transcript received: "
+            f"{len(transcript)} characters"
+        )
+
+        print(
+            "[PIPELINE] Starting Gemini translation..."
         )
 
         translator = GeminiTranslator(
@@ -1098,10 +1139,19 @@ def run_pipeline(
             )
         )
 
+        print(
+            f"[PIPELINE] Translation complete: "
+            f"{len(translation)} characters"
+        )
+
         telegram_ok = False
         telegram_message = ""
 
         try:
+
+            print(
+                "[PIPELINE] Sending translation to Telegram..."
+            )
 
             telegram_ok, telegram_message = (
                 asyncio.run(
@@ -1113,11 +1163,24 @@ def run_pipeline(
                 )
             )
 
+            print(
+                f"[PIPELINE] Telegram result: "
+                f"{telegram_message}"
+            )
+
         except Exception as exc:
+
+            print(
+                f"[PIPELINE] Telegram error: {exc}"
+            )
 
             telegram_message = (
                 f"שגיאה בטלגרם: {exc}"
             )
+
+        print("=" * 80)
+        print("[PIPELINE] SUCCESS")
+        print("=" * 80)
 
         return {
             "success": True,
@@ -1132,6 +1195,19 @@ def run_pipeline(
         }
 
     except Exception as exc:
+
+        print("=" * 80)
+        print("[PIPELINE] !!! FAILED !!!")
+        print(
+            f"[PIPELINE] Exception type: "
+            f"{type(exc).__name__}"
+        )
+        print(
+            f"[PIPELINE] Exception: {exc}"
+        )
+        print("[PIPELINE] Full traceback:")
+        traceback.print_exc()
+        print("=" * 80)
 
         return {
             "success": False,
