@@ -1,8 +1,7 @@
-fastapi
-uvicorn
-requests
-yt-dlp
-youtube-transcript-api
-google-genai
-telethon
-python-dotenv
+fastapi>=0.115,<1
+gunicorn>=23,<24
+uvicorn[standard]>=0.34,<1
+yt-dlp>=2025.01.15
+google-genai>=1.30,<2
+telethon>=1.41,<2
+pydantic>=2.8,<3
