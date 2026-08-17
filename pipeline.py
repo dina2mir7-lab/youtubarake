@@ -66,55 +66,37 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(url_or_id: str) -> str:
-    """חילוץ כתוביות יציב, פשוט ומקצועי באמצעות עוגיות"""
+    """חילוץ כתוביות יציב ותואם לכל גרסאות youtube-transcript-api בעזרת עוגיות"""
     video_id = extract_video_id(url_or_id)
     cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
     cookie_file_path = None
 
-    # אם הוגדרו עוגיות ב-Render, יוצרים קובץ זמני בפורמט Netscape
+    # יצירת קובץ cookies זמני במידה וקיים
     if cookies_text:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
             cookie_file.write(cookies_text)
             cookie_file_path = cookie_file.name
 
     try:
-        ytt_api = YouTubeTranscriptApi()
-        
-        # שליפה עם או בלי עוגיות
+        # שימוש ב-get_transcript הישיר והנתמך בכל הגרסאות לקבלת רשימת הדיקשנריז
         if cookie_file_path:
-            fetched = ytt_api.fetch(video_id, languages=["ar", "he", "en"], cookies=cookie_file_path)
+            transcript_list = YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=["ar", "he", "en"], 
+                cookies=cookie_file_path
+            )
         else:
-            fetched = ytt_api.fetch(video_id, languages=["ar", "he", "en"])
+            transcript_list = YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=["ar", "he", "en"]
+            )
 
-        return "\n".join(snippet.text for snippet in fetched.snippets)
+        # חילוץ הטקסט מתוך רשימת המילונים
+        return "\n".join(item["text"] for item in transcript_list)
 
     finally:
-        # ניקוי הקובץ הזמני
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
-
-
-def split_text(text, max_chars):
-    chunks = []
-    current_chunk = ""
-    lines = text.split("\n")
-
-    for line in lines:
-        if len(line) > max_chars:
-            for i in range(0, len(line), max_chars):
-                chunks.append(line[i: i + max_chars])
-            continue
-
-        if len(current_chunk) + len(line) + 1 > max_chars:
-            chunks.append(current_chunk.strip())
-            current_chunk = line + "\n"
-        else:
-            current_chunk += line + "\n"
-
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-
-    return chunks
 
 
 # ==========================================
