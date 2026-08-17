@@ -4,6 +4,7 @@ import time
 import asyncio
 import datetime
 import tempfile
+import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types
@@ -56,6 +57,67 @@ async def send_to_telegram(full_text: str, video_title: str, video_url: str):
 # ==========================================
 # איתור סרטונים וחילוץ
 # ==========================================
+def get_target_dates_strings():
+    today = datetime.date.today()
+    days_to_subtract = (today.weekday() - 4) % 7
+    last_friday = today - datetime.timedelta(days=days_to_subtract)
+    last_saturday = last_friday + datetime.timedelta(days=1)
+
+    separators = ['.', '/', '-']
+    date_formats = set()
+
+    def add_date_combinations(target_date):
+        days = [str(target_date.day), target_date.strftime('%d')]
+        months = [str(target_date.month), target_date.strftime('%m')]
+        years = [str(target_date.year), str(target_date.year)[2:]]
+        for d in days:
+            for m in months:
+                for y in years:
+                    for sep in separators:
+                        date_formats.add(f"{d}{sep}{m}{sep}{y}")
+
+    add_date_combinations(last_friday)
+    add_date_combinations(last_saturday)
+    return list(date_formats)
+
+
+def find_latest_friday_video(url, max_videos=15):
+    target_dates = get_target_dates_strings()
+    ydl_opts = {
+        'extract_flat': True,
+        'skip_download': True,
+        'playlistend': max_videos,
+        'ignoreerrors': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            result_dict = ydl.extract_info(url, download=False)
+            if not result_dict:
+                return None, None
+
+            videos = result_dict.get('entries', [])
+            if not videos and 'title' in result_dict:
+                videos = [result_dict]
+
+            for video in videos:
+                if not video:
+                    continue
+                title = video.get('title') or ''
+                v_id = video.get('id') or video.get('video_id')
+                if not v_id:
+                    continue
+
+                video_url = f"https://www.youtube.com/watch?v={v_id}"
+                if any(target_date in title for target_date in target_dates):
+                    return video_url, title
+
+            return None, None
+        except Exception as e:
+            print(f"⚠️ שגיאה בסריקת יוטיוב: {e}")
+            return None, None
+
+
 def extract_video_id(url_or_id: str) -> str:
     patterns = [r"(?:v=)([a-zA-Z0-9_-]{11})", r"(?:youtu\.be/)([a-zA-Z0-9_-]{11})", r"^([a-zA-Z0-9_-]{11})$"]
     for pattern in patterns:
@@ -71,14 +133,12 @@ def fetch_transcript(url_or_id: str) -> str:
     cookies_text = os.getenv("YOUTUBE_COOKIES_TEXT")
     cookie_file_path = None
 
-    # יצירת קובץ cookies זמני במידה וקיים
     if cookies_text:
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8") as cookie_file:
             cookie_file.write(cookies_text)
             cookie_file_path = cookie_file.name
 
     try:
-        # שימוש ב-get_transcript הישיר והנתמך בכל הגרסאות לקבלת רשימת הדיקשנריז
         if cookie_file_path:
             transcript_list = YouTubeTranscriptApi.get_transcript(
                 video_id, 
@@ -91,12 +151,34 @@ def fetch_transcript(url_or_id: str) -> str:
                 languages=["ar", "he", "en"]
             )
 
-        # חילוץ הטקסט מתוך רשימת המילונים
         return "\n".join(item["text"] for item in transcript_list)
 
     finally:
         if cookie_file_path and os.path.exists(cookie_file_path):
             os.remove(cookie_file_path)
+
+
+def split_text(text, max_chars):
+    chunks = []
+    current_chunk = ""
+    lines = text.split("\n")
+
+    for line in lines:
+        if len(line) > max_chars:
+            for i in range(0, len(line), max_chars):
+                chunks.append(line[i: i + max_chars])
+            continue
+
+        if len(current_chunk) + len(line) + 1 > max_chars:
+            chunks.append(current_chunk.strip())
+            current_chunk = line + "\n"
+        else:
+            current_chunk += line + "\n"
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
 
 
 # ==========================================
@@ -165,6 +247,15 @@ def run_pipeline(video_url: str = None, speaker: str = None):
     gemini_key = os.getenv("GEMINI_API_KEY")
     video_title = "סרטון יוטיוב"
 
+    # איתור קישור לפי דרשן במידת הצורך
+    if not video_url and speaker in SPEAKER_URLS:
+        target_channel_url = SPEAKER_URLS[speaker]
+        found_url, found_title = find_latest_friday_video(target_channel_url, max_videos=MAX_VIDEOS_TO_SCAN)
+        if not found_url:
+            return {"success": False, "message": f"לא נמצאה דרשה מתאימה ליום שישי האחרון עבור {speaker}."}
+        video_url = found_url
+        video_title = found_title
+
     if not video_url:
         return {"success": False, "message": "לא סופק קישור תקין ליוטיוב."}
 
@@ -177,7 +268,7 @@ def run_pipeline(video_url: str = None, speaker: str = None):
         original_file = os.path.join(temp_dir, f"transcript_{video_id}_orig.txt")
         translated_file = os.path.join(temp_dir, f"transcript_{video_id}_trans.txt")
 
-        # 1. חילוץ טרנסקריפט ישיר בעזרת עוגיות
+        # 1. חילוץ טרנסקריפט
         try:
             transcript_text = fetch_transcript(video_url)
             with open(original_file, "w", encoding="utf-8") as f:
