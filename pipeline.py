@@ -5,6 +5,7 @@ import tempfile
 import time
 from typing import Optional
 from urllib.request import Request, urlopen
+import traceback
 
 import yt_dlp
 from google import genai
